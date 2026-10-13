@@ -1,0 +1,9 @@
+.build/
+output/
+.DS_Store
+third_party/
+build/
+.build-dev/
+.superpowers/
+*.pyc
+__pycache__/

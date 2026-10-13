@@ -1,0 +1,14 @@
+[
+ {"name": "c-static-foliage", "source": "~/Downloads/Series 1 Carving the Landscape [DO2104H003S00].mp4", "start": 35677, "frames": 200, "kind": "real", "why": "720p, locked-off, dense eucalyptus leaves and bark: hallucinated texture shows as shimmer"},
+ {"name": "c-slow-gorge", "source": "~/Downloads/Series 1 Carving the Landscape [DO2104H003S00].mp4", "start": 55570, "frames": 200, "kind": "real", "why": "720p, slow move through layered red rock: the detailed-rock shimmer trap"},
+ {"name": "c-fast-waterfall", "source": "~/Downloads/Series 1 Carving the Landscape [DO2104H003S00].mp4", "start": 3041, "frames": 200, "kind": "real", "why": "720p, fast aerial pan over rock and white water"},
+ {"name": "c-water-climbers", "source": "~/Downloads/Series 1 Carving the Landscape [DO2104H003S00].mp4", "start": 55014, "frames": 200, "kind": "real", "why": "720p, rock plus moving water and people (local motion)"},
+ {"name": "c-cut-nest", "source": "~/Downloads/Series 1 Carving the Landscape [DO2104H003S00].mp4", "start": 27707, "frames": 150, "kind": "real", "why": "720p, hard cut from desert tree to a static nest close-up: tests state leaking across cuts"},
+ {"name": "e-gorge-river", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 53487, "frames": 150, "kind": "real", "why": "1080p, slow pan over river gorge"},
+ {"name": "e-night-grass", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 58840, "frames": 150, "kind": "real", "why": "1080p, dark headlamp scene, noisy grass"},
+ {"name": "g-lizard-grass", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 28782, "frames": 100, "kind": "gt", "why": "GT, static frill-neck lizard in grass"},
+ {"name": "g-waterfall", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 45088, "frames": 100, "kind": "gt", "why": "GT, slow pan, rock walls and waterfall"},
+ {"name": "g-wallaby-fast", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 17273, "frames": 100, "kind": "gt", "why": "GT, fast pan, wallaby splashing"},
+ {"name": "g-frog-rain", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 35396, "frames": 100, "kind": "gt", "why": "GT, frog in falling rain (local motion)"},
+ {"name": "g-cut-gorge", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 53417, "frames": 100, "kind": "gt", "why": "GT, hard cut into the river gorge shot"}
+]
