@@ -1,5 +1,6 @@
 public enum UpscaleError: Error, CustomStringConvertible {
     case invalidSize(String)
+    case invalidCrop(String)
     case notAnUpscale(source: String, target: String)
     case metalUnavailable
     case scalerUnavailable(String)
@@ -10,6 +11,7 @@ public enum UpscaleError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case let .invalidSize(text): "Invalid size '\(text)'. Use 4k, 1440p, 1080p, 8k, WIDTHxHEIGHT (e.g. 3840x2160) or a factor like 2x."
+        case let .invalidCrop(text): "Invalid crop '\(text)'. Use X,Y,W,H in source pixels (e.g. 0,0,320,180)."
         case let .notAnUpscale(source, target): "Target \(target) is not larger than the source \(source); MetalFX only upscales."
         case .metalUnavailable: "No Metal GPU is available."
         case let .scalerUnavailable(reason): reason
