@@ -23,7 +23,8 @@ let usage = """
     multiple of the source). Each directory gets one float16 CHW file per frame plus meta.json:
       --dump-source DIR  The decoded source frames (RGB).
       --dump-base DIR    Apple's 4x frames resized to the output size (RGB).
-      --dump-flow DIR    VideoToolbox optical flow between source frames (not available yet).
+      --dump-flow DIR    VideoToolbox optical flow between consecutive source frames, in source pixels
+                         (4 channels: back_x, back_y, fwd_x, fwd_y; frame 0 is zeros, marked invalid).
       --dump-crop X,Y,W,H  Dump only this window, in source pixels (default: the whole frame).
                          The base is cropped to the same window times the scale.
 

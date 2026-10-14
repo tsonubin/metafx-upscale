@@ -72,6 +72,7 @@ struct DumpJobTests {
         options.engine = .ml
         options.dumps = DumpOptions(
             source: dir.appendingPathComponent("s"), base: dir.appendingPathComponent("b"),
+            flow: dir.appendingPathComponent("f"),
             crop: CropRect(x: 100, y: 50, width: 64, height: 32))
         return options
     }
@@ -84,7 +85,7 @@ struct DumpJobTests {
             _ = try await VideoUpscaler.upscale(
                 input: clip, output: dir.appendingPathComponent("out.mp4"), options: options(dir), onProgress: { _ in })
 
-            for (name, width, height, scale) in [("s", 64, 32, 1), ("b", 128, 64, 2)] {
+            for (name, width, height, scale) in [("s", 64, 32, 1), ("b", 128, 64, 2), ("f", 64, 32, 1)] {
                 let meta = try readMeta(dir.appendingPathComponent(name))
                 #expect(meta["frames"] as? Int == 6)
                 #expect(meta["width"] as? Int == width && meta["height"] as? Int == height)
@@ -96,6 +97,10 @@ struct DumpJobTests {
             }
             let size = try Data(contentsOf: dir.appendingPathComponent("b/000005.f16")).count
             #expect(size == 3 * 128 * 64 * 2)
+            let flowMeta = try readMeta(dir.appendingPathComponent("f"))
+            #expect(flowMeta["kind"] as? String == "flow" && flowMeta["channels"] as? Int == 4)
+            #expect(flowMeta["valid"] as? [Bool] == [false, true, true, true, true, true])
+            #expect(try Data(contentsOf: dir.appendingPathComponent("f/000005.f16")).count == 4 * 64 * 32 * 2)
         }
     }
 
@@ -115,7 +120,7 @@ struct DumpJobTests {
                     input: clip, output: dir.appendingPathComponent("out.mp4"), options: options, onProgress: { _ in })
             }
 
-            for name in ["s", "b"] {
+            for name in ["s", "b", "f"] {
                 let meta = try readMeta(dir.appendingPathComponent(name))
                 #expect(meta["frames"] as? Int == 4)
                 #expect((meta["valid"] as? [Bool])?.count == 4)

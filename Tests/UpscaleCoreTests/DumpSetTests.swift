@@ -121,10 +121,28 @@ struct DumpSetTests {
             let dumps = try DumpSet(
                 options: DumpOptions(source: sourceDir), sourceWidth: 8, sourceHeight: 6, outputWidth: 16, outputHeight: 12)
             #expect(dumps.crop == CropRect(x: 0, y: 0, width: 8, height: 6))
+            let source = try makeBuffer(width: 8, height: 6) { _, _ in (0.5, 0.5, 0.5, 1) }
+            let upscaled = try makeBuffer(width: 32, height: 24) { _, _ in (0, 0, 0, 1) }
+            try dumps.record(source: source, upscaled: upscaled, at: .zero)
             try dumps.finish()
             let meta = try readMeta(sourceDir)
-            #expect(meta["frames"] as? Int == 0)
+            #expect(meta["frames"] as? Int == 1)
             #expect(meta["width"] as? Int == 8 && meta["height"] as? Int == 6)
+        }
+    }
+
+    @Test func aRunThatRecordedNoFramesLeavesNoMeta() throws {
+        // Something failing before the first frame must not leave a meta.json, which marks a dump as finished.
+        try withTempDirectory { root in
+            let dirs = ["s", "b"].map { root.appendingPathComponent($0) }
+            let dumps = try DumpSet(
+                options: DumpOptions(source: dirs[0], base: dirs[1]),
+                sourceWidth: 8, sourceHeight: 6, outputWidth: 16, outputHeight: 12)
+            try dumps.finish()
+            for dir in dirs {
+                #expect(FileManager.default.fileExists(atPath: dir.path))
+                #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("meta.json").path))
+            }
         }
     }
 
@@ -144,11 +162,85 @@ struct DumpSetTests {
         }
     }
 
-    @Test func flowDumpsAreNotAvailableYet() {
-        #expect(throws: UpscaleError.self) {
-            try DumpSet(
-                options: DumpOptions(flow: URL(fileURLWithPath: "/tmp/never-written")),
-                sourceWidth: 8, sourceHeight: 6, outputWidth: 16, outputHeight: 12)
+    @Test(.enabled(if: opticalFlowSupported))
+    func recordsFlowOnTheSourceCrop() throws {
+        // Content moves 4 px right per frame. The flow is cropped to the source window and is in source pixels.
+        let (width, height) = flowTestSize
+        let first = try NoiseFrames.pair(width: width, height: height, dx: 4, dy: 0)
+        let third = try NoiseFrames.pair(width: width, height: height, dx: 8, dy: 0).current
+        let frames = [first.previous, first.current, third]
+        try withTempDirectory { root in
+            let (sourceDir, flowDir) = (root.appendingPathComponent("s"), root.appendingPathComponent("f"))
+            let crop = CropRect(x: 100, y: 50, width: 64, height: 32)
+            let dumps = try DumpSet(
+                options: DumpOptions(source: sourceDir, flow: flowDir, crop: crop),
+                sourceWidth: width, sourceHeight: height, outputWidth: 2 * width, outputHeight: 2 * height)
+            for (index, frame) in frames.enumerated() {
+                try dumps.record(source: frame, upscaled: frame, at: CMTime(value: Int64(index), timescale: 25))
+            }
+            try dumps.finish()
+
+            let meta = try readMeta(flowDir)
+            #expect(meta["kind"] as? String == "flow")
+            #expect(meta["frames"] as? Int == 3)
+            #expect(meta["channels"] as? Int == 4)
+            #expect(meta["width"] as? Int == 64 && meta["height"] as? Int == 32)
+            #expect(meta["crop"] as? [Int] == [100, 50, 64, 32])
+            #expect(meta["scale"] as? Int == 1)
+            #expect(meta["source_size"] as? [Int] == [width, height])
+            #expect(meta["valid"] as? [Bool] == [false, true, true])
+            #expect(meta["flow_channels"] as? [String] == ["back_x", "back_y", "fwd_x", "fwd_y"])
+            #expect(meta["flow_units"] as? String == "source_px")
+            let pts = try #require(meta["pts"] as? [Double])
+            #expect(pts.count == 3 && abs(pts[2] - 0.08) < 1e-9)
+            #expect(try readMeta(sourceDir)["frames"] as? Int == 3)
+
+            // Frame 0 has no previous frame: zeros.
+            let plane = 64 * 32
+            let zeros = try readHalves(flowDir.appendingPathComponent("000000.f16"))
+            #expect(zeros.count == 4 * plane && zeros.allSatisfy { $0 == 0 })
+            for index in 1...2 {
+                let flow = try readHalves(flowDir.appendingPathComponent(String(format: "%06d.f16", index)))
+                #expect(flow.count == 4 * plane)
+                let backX = median(flow[0..<plane]), backY = median(flow[plane..<2 * plane])
+                let forwardX = median(flow[2 * plane..<3 * plane]), forwardY = median(flow[3 * plane..<4 * plane])
+                #expect(backX > -4.5 && backX < -3.5, "frame \(index) back x was \(backX)")
+                #expect(forwardX > 3.5 && forwardX < 4.5, "frame \(index) forward x was \(forwardX)")
+                #expect(abs(backY) < 0.5 && abs(forwardY) < 0.5, "frame \(index) y was \(backY), \(forwardY)")
+            }
+        }
+    }
+
+    @Test(.enabled(if: opticalFlowSupported))
+    func flowForTheFullFrameHasTheSourceGrid() throws {
+        let (width, height) = flowTestSize
+        let frames = try NoiseFrames.pair(width: width, height: height, dx: 4, dy: 0)
+        try withTempDirectory { root in
+            let flowDir = root.appendingPathComponent("f")
+            let dumps = try DumpSet(
+                options: DumpOptions(flow: flowDir),
+                sourceWidth: width, sourceHeight: height, outputWidth: 2 * width, outputHeight: 2 * height)
+            try dumps.record(source: frames.previous, upscaled: frames.previous, at: .zero)
+            try dumps.record(source: frames.current, upscaled: frames.current, at: CMTime(value: 1, timescale: 25))
+            try dumps.finish()
+            let meta = try readMeta(flowDir)
+            #expect(meta["width"] as? Int == width && meta["height"] as? Int == height)
+            #expect(meta["crop"] as? [Int] == [0, 0, width, height])
+            #expect(try readHalves(flowDir.appendingPathComponent("000001.f16")).count == 4 * width * height)
+        }
+    }
+
+    @Test(.enabled(if: opticalFlowSupported))
+    func flowDumpIsRefusedForSizesWhoseFlowCannotBeTurnedIntoSourcePixels() throws {
+        try withTempDirectory { root in
+            let dirs = ["s", "f"].map { root.appendingPathComponent($0) }
+            #expect(throws: UpscaleError.self) {
+                try DumpSet(
+                    options: DumpOptions(source: dirs[0], flow: dirs[1]),
+                    sourceWidth: 256, sourceHeight: 144, outputWidth: 512, outputHeight: 288)
+            }
+            // The estimator is set up before any directory is created.
+            #expect(dirs.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
         }
     }
 }

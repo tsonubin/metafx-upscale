@@ -10,7 +10,7 @@ public struct DumpOptions {
     public var source: URL?
     /// Apple's 4× frames resized to the output size (RGB), cropped to `crop` scaled by the integer scale.
     public var base: URL?
-    /// VideoToolbox optical flow between consecutive source frames.
+    /// VideoToolbox optical flow between consecutive source frames, in source pixels, on the source crop's grid.
     public var flow: URL?
     /// The window to dump, in source pixels; `nil` dumps the whole frame.
     public var crop: CropRect?
@@ -38,7 +38,8 @@ func baseScale(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeig
 }
 
 /// The frame dumps of one video job. It owns the writers, records each processed frame, and writes every
-/// `meta.json` in `finish()`, which the job calls however it ends so a partial dump is still readable.
+/// `meta.json` in `finish()`, which the job calls however it ends so a partial dump is still readable. A dump that
+/// recorded no frames gets no `meta.json` (see `FrameDumpWriter.finish`).
 ///
 /// Not thread-safe: `record` and `finish` must be called from one queue at a time, like `FrameDumpWriter`.
 final class DumpSet {
@@ -47,15 +48,23 @@ final class DumpSet {
     /// The dumped window in source pixels.
     let crop: CropRect
 
+    /// Flow between two consecutive source frames: backward, forward, and the size of the flow grid.
+    private typealias FlowEstimate = (CVPixelBuffer, CVPixelBuffer, Bool) throws
+        -> (backward: [Float16], forward: [Float16], width: Int, height: Int)
+
     private let sourceWriter: FrameDumpWriter?
     private let baseWriter: FrameDumpWriter?
     private let baseResizer: BaseResizer?
     private let baseCrop: CropRect
+    private let flowWriter: FrameDumpWriter?
+    private let estimateFlow: FlowEstimate?
+    private let sourceSize: (width: Int, height: Int)
+    /// The previous frame's source, for the flow into the current one.
+    private var previousSource: CVPixelBuffer?
+    private var flowPairs = 0
     private var finished = false
 
     init(options: DumpOptions, sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int) throws {
-        // Task 3 replaces this with the optical-flow writer.
-        guard options.flow == nil else { throw UpscaleError.unsupportedInput("--dump-flow isn't available yet.") }
         let scale = try baseScale(
             sourceWidth: sourceWidth, sourceHeight: sourceHeight, outputWidth: outputWidth, outputHeight: outputHeight)
         let crop = options.crop ?? CropRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight)
@@ -67,9 +76,21 @@ final class DumpSet {
         }
         let baseCrop = CropRect(x: crop.x * scale, y: crop.y * scale, width: crop.width * scale, height: crop.height * scale)
 
+        // Set up the estimator before any directory is created, so a source it can't handle leaves nothing behind.
+        if options.flow != nil {
+            guard #available(macOS 26.0, *) else {
+                throw UpscaleError.scalerUnavailable("Optical flow dumps need macOS 26 or later.")
+            }
+            let estimator = try OpticalFlowEstimator(width: sourceWidth, height: sourceHeight)
+            estimateFlow = { try estimator.flow(previous: $0, current: $1, sequential: $2) }
+        } else {
+            estimateFlow = nil
+        }
+
         self.scale = scale
         self.crop = crop
         self.baseCrop = baseCrop
+        sourceSize = (sourceWidth, sourceHeight)
         sourceWriter = try options.source.map {
             try FrameDumpWriter(
                 directory: $0, kind: "source", channels: 3, width: crop.width, height: crop.height,
@@ -84,18 +105,44 @@ final class DumpSet {
             baseWriter = nil
             baseResizer = nil
         }
+        // The flow is resampled onto the source crop, in source pixels, so its grid is the source dump's.
+        flowWriter = try options.flow.map {
+            try FrameDumpWriter(
+                directory: $0, kind: "flow", channels: 4, width: crop.width, height: crop.height,
+                sourceSize: (sourceWidth, sourceHeight), scale: 1, crop: crop,
+                extra: ["flow_channels": ["back_x", "back_y", "fwd_x", "fwd_y"], "flow_units": "source_px"])
+        }
     }
 
-    /// Records one frame: the decoded `source` and, when a base dump is wanted, the model's 4× `upscaled` frame
-    /// resized to the output size. Both are computed before either is written, so the dumps keep equal frame counts.
+    /// Records one frame: the decoded `source`, when a base dump is wanted the model's 4× `upscaled` frame resized to
+    /// the output size, and when a flow dump is wanted the flow from the previous source frame into this one. All are
+    /// computed before any is written, so the dumps keep equal frame counts. Frames must arrive in order.
     func record(source: CVPixelBuffer, upscaled: CVPixelBuffer, at time: CMTime) throws {
         let sourcePlanes = try sourceWriter.map { _ in try Self.rgbPlanes(of: source, crop: crop) }
         var basePlanes: [Float16]?
         if let baseResizer {
             basePlanes = try Self.rgbPlanes(of: try baseResizer.resize(upscaled), crop: baseCrop)
         }
+        let flow = try flowWriter.map { _ in try flowFrame(into: source) }
         if let sourceWriter, let sourcePlanes { try sourceWriter.write(sourcePlanes, pts: time.seconds) }
         if let baseWriter, let basePlanes { try baseWriter.write(basePlanes, pts: time.seconds) }
+        if let flowWriter, let flow { try flowWriter.write(flow.planes, pts: time.seconds, valid: flow.valid) }
+        if flowWriter != nil { previousSource = source }
+    }
+
+    /// `[back_x, back_y, fwd_x, fwd_y]` on the crop's grid, in source pixels. The first frame has nothing before it:
+    /// zeros, marked invalid.
+    private func flowFrame(into source: CVPixelBuffer) throws -> (planes: [Float16], valid: Bool) {
+        let size = 4 * crop.width * crop.height
+        guard let previousSource, let estimateFlow else { return ([Float16](repeating: 0, count: size), false) }
+        let flow = try estimateFlow(previousSource, source, flowPairs > 0)
+        flowPairs += 1
+        func onCrop(_ field: [Float16]) -> [Float16] {
+            FlowGrid.resample(
+                field, width: flow.width, height: flow.height, sourceWidth: sourceSize.width,
+                sourceHeight: sourceSize.height, crop: crop)
+        }
+        return (onCrop(flow.backward) + onCrop(flow.forward), true)
     }
 
     /// Writes every `meta.json` for the frames recorded so far. Safe to call more than once.
@@ -103,7 +150,8 @@ final class DumpSet {
         guard !finished else { return }
         finished = true
         var firstError: Error?
-        for writer in [sourceWriter, baseWriter].compactMap({ $0 }) {
+        previousSource = nil
+        for writer in [sourceWriter, baseWriter, flowWriter].compactMap({ $0 }) {
             do { try writer.finish() } catch { firstError = firstError ?? error }
         }
         if let firstError { throw firstError }
@@ -114,7 +162,7 @@ final class DumpSet {
         let format = CVPixelBufferGetPixelFormatType(buffer)
         guard format == kCVPixelFormatType_64RGBAHalf else {
             throw UpscaleError.unsupportedInput(
-                "Frame dumps need half-float RGBA frames, but the buffer is format \(fourCC(format)).")
+                "Frame dumps need half-float RGBA frames, but the buffer is format \(PixelBuffers.fourCC(format)).")
         }
         let (width, height) = (CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer))
         guard crop.x >= 0, crop.y >= 0, crop.width > 0, crop.height > 0,
@@ -123,10 +171,13 @@ final class DumpSet {
             throw UpscaleError.unsupportedInput(
                 "The crop \(crop.x),\(crop.y),\(crop.width),\(crop.height) doesn't fit inside a \(width)x\(height) frame.")
         }
-        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess,
-              let base = CVPixelBufferGetBaseAddress(buffer)
-        else { throw UpscaleError.io("Could not read the frame's pixels for the dump.") }
+        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+            throw UpscaleError.io("Could not read the frame's pixels for the dump.")
+        }
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+            throw UpscaleError.io("Could not read the frame's pixels for the dump.")
+        }
 
         let stride = CVPixelBufferGetBytesPerRow(buffer)
         let plane = crop.width * crop.height
@@ -143,12 +194,6 @@ final class DumpSet {
             }
         }
         return planes
-    }
-
-    private static func fourCC(_ format: OSType) -> String {
-        let bytes = [24, 16, 8, 0].map { UInt8((format >> $0) & 0xFF) }
-        let text = String(decoding: bytes, as: UTF8.self)
-        return bytes.allSatisfy { $0 >= 32 && $0 < 127 } ? "'\(text)'" : String(format)
     }
 }
 

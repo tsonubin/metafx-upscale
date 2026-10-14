@@ -34,6 +34,13 @@ extension FrameUpscaler: VideoFrameEngine {
 enum PixelBuffers {
     static let tenBitYUV = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
 
+    /// A pixel format as its four-character code ('RGhA'), or the number when it isn't printable, for messages.
+    static func fourCC(_ format: OSType) -> String {
+        let bytes = [24, 16, 8, 0].map { UInt8((format >> $0) & 0xFF) }
+        let text = String(decoding: bytes, as: UTF8.self)
+        return bytes.allSatisfy { $0 >= 32 && $0 < 127 } ? "'\(text)'" : String(format)
+    }
+
     /// Metal-compatible, IOSurface-backed 32BGRA, optionally at a fixed size.
     static func bgraAttributes(width: Int? = nil, height: Int? = nil) -> [String: Any] {
         attributes(format: kCVPixelFormatType_32BGRA, width: width, height: height)

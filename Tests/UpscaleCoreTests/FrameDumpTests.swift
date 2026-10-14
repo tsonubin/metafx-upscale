@@ -73,6 +73,19 @@ struct FrameDumpTests {
         }
     }
 
+    @Test func finishWithoutFramesWritesNoMeta() throws {
+        try withTempDirectory { dir in
+            let writer = try makeWriter(dir)
+            try writer.finish()
+            #expect(FileManager.default.fileExists(atPath: dir.path))
+            #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("meta.json").path))
+            // Once a frame is in, finish writes it.
+            try writer.write([Float16](repeating: 0, count: 24), pts: 0)
+            try writer.finish()
+            #expect(try readMeta(dir)["frames"] as? Int == 1)
+        }
+    }
+
     @Test func rejectsFrameOfWrongSize() throws {
         try withTempDirectory { dir in
             let writer = try makeWriter(dir)

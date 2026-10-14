@@ -73,8 +73,10 @@ public final class FrameDumpWriter {
         validFlags.append(valid)
     }
 
-    /// Writes (or rewrites) meta.json for the frames written so far.
+    /// Writes (or rewrites) meta.json for the frames written so far. With no frames it writes nothing: a dump
+    /// that has a meta.json is a finished one, and a run that failed before its first frame must not look like that.
     public func finish() throws {
+        guard !times.isEmpty else { return }
         var meta = header
         meta["frames"] = times.count
         meta["pts"] = times
