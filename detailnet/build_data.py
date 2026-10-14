@@ -20,9 +20,11 @@ half a frame so rounding in either tool cannot move the boundary. `detailnet/che
 sequence against ffmpeg.
 
 Resumable: a sequence is skipped only when its spec.json matches and every dump's meta.json holds burn_in + frames
-frames; anything else is deleted and rebuilt. Sequences run one at a time (the ml engine uses the GPU and Media
-Engine fully). A sequence that fails is removed and logged; five failures in a row, or swap growing by more than the
-guard's limit, stop the run (exit 1, exit 3). Progress goes to stdout, one line per sequence, ending in a SUMMARY line.
+frames; anything else is deleted and rebuilt, except a directory that already holds teacher/ targets (FlashVSR costs
+seconds per frame): that one is kept, logged STALE-KEPT and counted as failed, unless `--rebuild` is passed. Sequences
+run one at a time (the ml engine uses the GPU and Media Engine fully). A sequence that fails is removed and logged; five
+failures in a row, or swap growing by more than the guard's limit, stop the run (exit 1, exit 3). Progress goes to
+stdout, one line per sequence, ending in a SUMMARY line.
 """
 import argparse
 import json
@@ -69,6 +71,10 @@ BT709 = ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt7
 
 class BuildError(Exception):
     """One sequence could not be built."""
+
+
+class StaleKept(BuildError):
+    """A sequence directory out of step with its spec was left alone because it holds teacher/ targets."""
 
 
 class Episode(NamedTuple):
@@ -295,20 +301,25 @@ def plan(kind, n, seed, shots_dir):
 class Builder:
     """Builds sequences into `out`. `run(cmd, timeout)` runs a tool (tests replace it)."""
 
-    def __init__(self, out, binary, episodes, run=run_checked):
+    def __init__(self, out, binary, episodes, run=run_checked, rebuild=False):
         self.out, self.binary, self.episodes, self.run = Path(out), Path(binary), episodes, run
+        self.rebuild = rebuild  # also delete stale sequences that hold teacher/ targets
 
     def seq_dir(self, kind, index):
         return self.out / kind / f"{index:05d}"
 
     def build(self, index, spec):
         """Build one sequence (skipped when already complete). Returns 'built' or 'skipped'; BuildError on failure,
-        after removing the partial directory."""
+        after removing the partial directory. A stale or incomplete directory holding teacher/ targets is not
+        touched (StaleKept) unless `rebuild`."""
         record = spec_record(index, spec)
         seq = self.seq_dir(spec.kind, index)
         if is_complete(seq, record):
             return "skipped"
         if seq.exists():
+            if (seq / "teacher").exists() and not self.rebuild:
+                raise StaleKept(f"{seq} is out of step with its spec but holds teacher targets; kept "
+                                "(pass --rebuild to delete and rebuild it)")
             shutil.rmtree(seq)
         seq.mkdir(parents=True)
         started = time.monotonic()
@@ -397,10 +408,13 @@ def run_all(builder, specs_by_kind, limit, guard, log=print):
             code = SWAP_EXIT_CODE
             break
         t0 = time.monotonic()
+        label = None
         try:
             result = builder.build(i, spec)
             consecutive_failures = 0
             note = ""
+        except StaleKept as error:  # a deliberate stop for this sequence, not a tool failure: no streak
+            result, label, note = "failed", "STALE-KEPT", f"  {error}"
         except BuildError as error:
             result, note = "failed", f"  {str(error).splitlines()[0][:200]}"
             consecutive_failures += 1
@@ -411,7 +425,7 @@ def run_all(builder, specs_by_kind, limit, guard, log=print):
         remaining = len(jobs) - number
         eta = f" eta {hms(remaining * elapsed / number)}" if counts["built"] and remaining else ""
         log(f"[{number:4d}/{len(jobs)}] {kind} {i:05d} {episode_tag(spec.episode)} start={spec.start} "
-            f"burn_in={spec.burn_in} frames={spec.frames} {spec.bucket:<8} {result.upper():<7} "
+            f"burn_in={spec.burn_in} frames={spec.frames} {spec.bucket:<8} {label or result.upper():<7} "
             f"{time.monotonic() - t0:5.1f}s | built {counts['built']} skipped {counts['skipped']} "
             f"failed {counts['failed']} | elapsed {hms(elapsed)}{eta}{note}")
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -436,6 +450,8 @@ def main(argv=None):
     parser.add_argument("--episodes", default=str(DEFAULT_EPISODES), help="folder with the episode .mp4 files")
     parser.add_argument("--shots", default=str(DEFAULT_SHOTS), help="folder with the <stem>.frames.csv shot maps")
     parser.add_argument("--swap-limit-gb", type=float, default=8.0)
+    parser.add_argument("--rebuild", action="store_true",
+                        help="also delete and rebuild stale sequences that already hold teacher/ targets")
     args = parser.parse_args(argv)
 
     if not Path(args.binary).exists():
@@ -455,7 +471,7 @@ def main(argv=None):
         episodes.update(load_episodes(args.episodes, kind))
     print(f"building {len(specs['teacher'])} teacher + {len(specs['gt'])} gt sequences into {out} "
           f"(seed {args.seed}, limit {args.limit}, swap limit {args.swap_limit_gb:g} GB)", flush=True)
-    builder = Builder(out, args.binary, episodes)
+    builder = Builder(out, args.binary, episodes, rebuild=args.rebuild)
     code, _ = run_all(builder, specs, args.limit, guard, log=lambda line: print(line, flush=True))
     return code
 

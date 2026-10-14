@@ -5,9 +5,9 @@ import numpy as np
 import pytest
 
 from detailnet import build_data
-from detailnet.build_data import (EPISODES, BuildError, Builder, Episode, check_cuts, check_metas, check_pts,
-                                  dump_crop, ffmpeg_seek, gt_bitrate, is_complete, prores_cmd, run_all, spec_record,
-                                  swift_cmd, swift_range, x264_cmd)
+from detailnet.build_data import (EPISODES, BuildError, Builder, Episode, StaleKept, check_cuts, check_metas,
+                                  check_pts, dump_crop, ffmpeg_seek, gt_bitrate, is_complete, prores_cmd, run_all,
+                                  spec_record, swift_cmd, swift_range, x264_cmd)
 from detailnet.dumps import DumpWriter, read_meta
 from detailnet.guards import SwapGuard, SwapLimitExceeded
 from detailnet.sampling import SeqSpec
@@ -299,6 +299,63 @@ def test_incomplete_or_stale_sequence_is_rebuilt(tmp_path, damage):
     assert is_complete(seq, spec_record(0, spec))
 
 
+def add_teacher_targets(seq):
+    """A teacher/ dump next to the build's dumps, as detailnet/teacher.py leaves it."""
+    writer = DumpWriter(seq / "teacher", "teacher", 3, 6, 4, (1280, 720), 3, CROP)
+    writer.write(np.zeros((3, 4, 6), np.float16), 0.0)
+    writer.finish()
+
+
+def make_stale_with_teacher(tmp_path, tools, builder=None):
+    """Sequence 0 built, given teacher targets, then its spec.json changed (another seed's sampling)."""
+    builder = builder or make_builder(tmp_path, tools)
+    spec = make_spec()
+    builder.build(0, spec)
+    seq = tmp_path / "out" / "teacher" / "00000"
+    add_teacher_targets(seq)
+    saved = json.loads((seq / "spec.json").read_text())
+    saved["start"] += 1
+    (seq / "spec.json").write_text(json.dumps(saved))
+    return builder, spec, seq
+
+
+def test_stale_sequence_with_teacher_targets_is_kept(tmp_path):
+    tools = FakeTools()
+    builder, spec, seq = make_stale_with_teacher(tmp_path, tools)
+    spec_before = (seq / "spec.json").read_text()
+    calls = len(tools.cmds)
+    with pytest.raises(StaleKept, match="teacher"):
+        builder.build(0, spec)
+    assert len(tools.cmds) == calls  # nothing was run
+    assert (seq / "teacher" / "meta.json").exists() and (seq / "source" / "meta.json").exists()
+    assert (seq / "spec.json").read_text() == spec_before
+
+
+def test_rebuild_flag_replaces_a_stale_sequence_that_has_teacher_targets(tmp_path):
+    tools = FakeTools()
+    builder = make_builder(tmp_path, tools)
+    builder.rebuild = True
+    builder, spec, seq = make_stale_with_teacher(tmp_path, tools, builder)
+    calls = len(tools.cmds)
+    assert builder.build(0, spec) == "built"
+    assert len(tools.cmds) > calls
+    assert not (seq / "teacher").exists()  # the old targets belonged to the old sampling
+    assert is_complete(seq, spec_record(0, spec))
+
+
+def test_stale_sequence_without_teacher_targets_is_still_rebuilt_by_default(tmp_path):
+    tools = FakeTools()
+    builder = make_builder(tmp_path, tools)
+    spec = make_spec()
+    builder.build(0, spec)
+    seq = tmp_path / "out" / "teacher" / "00000"
+    saved = json.loads((seq / "spec.json").read_text())
+    saved["start"] += 1
+    (seq / "spec.json").write_text(json.dumps(saved))
+    assert builder.build(0, spec) == "built"
+    assert is_complete(seq, spec_record(0, spec))
+
+
 def test_check_metas_reports_wrong_shapes(tmp_path):
     spec = make_spec()
     FakeTools()(["bin/metalfx-upscale", "in.mp4", str(tmp_path / "tmp-upscale.mp4"), "--start", "1", "--duration",
@@ -387,6 +444,39 @@ def test_five_failures_in_a_row_stop_the_run(tmp_path):
     code, counts = run_all(make_builder(tmp_path, FakeTools(frame_delta=1)), specs, None, Guard(), lines.append)
     assert code == 1 and counts["failed"] == 5
     assert any("5 failures in a row" in line for line in lines)
+
+
+def test_run_all_logs_stale_kept_counts_it_as_failed_and_continues(tmp_path):
+    specs = specs_by_kind(teacher=8, gt=0)  # more than the five-failures-in-a-row limit
+    tools = FakeTools()
+    builder = make_builder(tmp_path, tools)
+    run_all(builder, specs, None, Guard(), lambda line: None)
+    for i in range(1, 7):  # sequences 1..6 get teacher targets and a stale spec
+        seq = builder.seq_dir("teacher", i)
+        add_teacher_targets(seq)
+        saved = json.loads((seq / "spec.json").read_text())
+        saved["start"] += 1
+        (seq / "spec.json").write_text(json.dumps(saved))
+    lines = []
+    code, counts = run_all(builder, specs, None, Guard(), lines.append)
+    assert counts == {"built": 0, "skipped": 2, "failed": 6}  # the run went on past the sixth to the last
+    assert code == 1
+    assert sum("STALE-KEPT" in line for line in lines) == 6
+    assert not any("in a row" in line for line in lines)
+    assert all((builder.seq_dir("teacher", i) / "teacher" / "meta.json").exists() for i in range(1, 7))
+
+
+def test_main_rebuild_flag_reaches_the_builder(tmp_path, monkeypatch):
+    binary = tmp_path / "metalfx-upscale"
+    binary.write_text("")
+    monkeypatch.setattr(build_data, "plan", lambda kind, n, seed, shots: specs_by_kind()[kind])
+    monkeypatch.setattr(build_data, "load_episodes", lambda d, kind: {})
+    seen = []
+    monkeypatch.setattr(build_data, "run_all", lambda builder, *a, **k: seen.append(builder) or (0, {}))
+    args = ["--out", str(tmp_path / "out"), "--teacher-seqs", "3", "--gt-seqs", "2", "--binary", str(binary)]
+    build_data.main(args)
+    build_data.main(args + ["--rebuild"])
+    assert [b.rebuild for b in seen] == [False, True]
 
 
 def test_main_exit_code_3_when_swap_grows(tmp_path, monkeypatch):
