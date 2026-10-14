@@ -11,9 +11,11 @@ import numpy as np
 import pytest
 import torch
 
-from detailnet import bench_dumps, run_bench
+from detailnet import bench_dumps, guards, run_bench, train
 from detailnet.build_data import BuildError
+from detailnet.data import clean_flow
 from detailnet.dumps import DumpWriter, read_meta
+from detailnet.guards import SwapGuard
 from detailnet.model import DetailNet
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +30,14 @@ H, W = 12, 16  # synthetic source size (px); the x3 base is 36 x 48
 @pytest.fixture(autouse=True)
 def seeded():
     torch.manual_seed(0)
+
+
+@pytest.fixture(autouse=True)
+def quiet_guards(monkeypatch):
+    """main() must not depend on this machine: no batch running, no swap growth. Tests of the guards inject readers."""
+    for module in (run_bench, bench_dumps):
+        monkeypatch.setattr(module, "refuse_if_batch_running", lambda force: None, raising=False)
+        monkeypatch.setattr(module, "SwapGuard", lambda limit: SwapGuard(limit, read=lambda: 0.0), raising=False)
 
 
 def small_net(boost=False):
@@ -234,6 +244,61 @@ def test_flow_is_clamped_like_training(tmp_path):
     assert all(max_diff(out[t], ref[t]) <= 1 for t in range(4))
 
 
+class Recording(torch.nn.Module):
+    """Wraps a DetailNet and keeps every detail it returns (run_bench's first call is its untimed warm-up)."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net, self.scale, self.details = net, net.scale, []
+
+    def zero_state(self, *args):
+        return self.net.zero_state(*args)
+
+    def forward(self, *args):
+        detail, hidden = self.net(*args)
+        self.details.append(detail.clone())
+        return detail, hidden
+
+
+@pytest.mark.parametrize("ignore_cuts", [False, True])
+def test_the_bench_loop_gives_the_training_loops_details(tmp_path, ignore_cuts):
+    """run_bench runs DetailNet frame by frame with its own copy of the R23 rule; train.run_sequence is the training
+    version. Fed the same dumps (float32, flow cleaned) with the same resets, they must give the same details: reset at
+    the first frame, at the shot start (with --ignore-cuts the state is carried there, only the flow is zero), and at
+    the invalid flow."""
+    n, cut, bad = 9, 4, 7
+    data = synth(n)
+    write_clip(tmp_path, data, clip_spec(n, cuts=[cut]), invalid={bad})
+    net = small_net(boost=True)
+    rec = Recording(net)
+    run_frames(rec, tmp_path, ignore_cuts=ignore_cuts)
+    bench = rec.details[1:]
+    assert len(bench) == n
+
+    x = torch.from_numpy(data.x.astype(np.float32))[None]
+    base = torch.from_numpy(data.base.astype(np.float32))[None]
+    flow = data.flow.astype(np.float32)
+    flow[bad] = np.nan  # what the dump holds at the invalid frame
+    flow = torch.from_numpy(clean_flow(flow))[None]
+    reset = torch.zeros(1, n, dtype=torch.bool)
+    reset[0, [0, bad]] = True
+    if ignore_cuts:
+        flow[0, cut] = 0.0  # a shot start has no flow, but the state is carried
+    else:
+        reset[0, cut] = True
+    with torch.no_grad():
+        want = train.run_sequence(net, x, base, flow, reset)
+    for t in range(n):
+        assert torch.allclose(bench[t], want[t], atol=1e-6), (t, float((bench[t] - want[t]).abs().max()))
+    assert float(want[cut].abs().mean()) > 1e-3  # the details are not trivially zero
+    # the test has teeth: the other cut rule gives other details at the shot start
+    other = reset.clone()
+    other[0, cut] = ignore_cuts
+    with torch.no_grad():
+        alt = train.run_sequence(net, x, base, flow, other)
+    assert not torch.allclose(bench[cut], alt[cut], atol=1e-4)
+
+
 # ---------------------------------------------------------------- run_bench: files and stats
 
 def save_ckpt(path, net):
@@ -350,6 +415,115 @@ def test_checkpoint_is_required_exactly_when_not_base_only(tmp_path, capsys):
         run_bench.main(["--base-only", "--ckpt", str(ckpt), "--name", "apple-base", clip])
     err = capsys.readouterr().err
     assert "--ckpt" in err and "--base-only" in err
+
+
+# ---------------------------------------------------------------- run_bench: reserved names, guards
+
+def clip_and_ckpt(tmp_path):
+    write_clip(tmp_path / "t-clip", synth(2), clip_spec(2))
+    ckpt = tmp_path / "net.pt"
+    save_ckpt(ckpt, small_net())
+    return str(tmp_path / "t-clip"), str(ckpt)
+
+
+@pytest.mark.parametrize("name", ["apple", "apple-base", "gt", "bicubic", "realesrgan", "realesrgan-general",
+                                  "realbasicvsr", "realviformer", "flashvsr", "flashvsr-full", "flashvsr-c960",
+                                  "dn-nocut", "apple-nocut"])
+def test_names_of_reference_outputs_are_refused(tmp_path, capsys, name):
+    clip, ckpt = clip_and_ckpt(tmp_path)
+    with pytest.raises(SystemExit):
+        run_bench.main(["--ckpt", ckpt, "--name", name, "--device", "cpu", clip])
+    err = capsys.readouterr().err
+    assert "--name" in err and name in err
+    assert not (tmp_path / "t-clip" / "out").exists()
+
+
+@pytest.mark.parametrize("name", ["apple", "gt", "bicubic", "realesrgan", "flashvsr-c960", "apple-base-nocut"])
+def test_base_only_may_write_apple_base_and_nothing_else_reserved(tmp_path, capsys, name):
+    clip, _ = clip_and_ckpt(tmp_path)
+    with pytest.raises(SystemExit):
+        run_bench.main(["--base-only", "--name", name, clip])
+    assert "--name" in capsys.readouterr().err
+    assert not (tmp_path / "t-clip" / "out").exists()
+    assert run_bench.main(["--base-only", "--name", "apple-base", clip]) == 0
+
+
+def test_ordinary_names_are_accepted(tmp_path):
+    clip, ckpt = clip_and_ckpt(tmp_path)
+    for name in ("dn-r1", "dn-r2-s0.5", "applesauce", "my-flash"):
+        assert run_bench.main(["--ckpt", ckpt, "--name", name, "--device", "cpu", clip]) == 0
+        assert (tmp_path / "t-clip" / "out" / f"{name}.mkv").exists()
+
+
+def batch_running_readers(monkeypatch, module):
+    """The module's batch check with pgrep injected: the batch is running."""
+    looked = []
+
+    def pgrep(pattern):
+        looked.append(pattern)
+        return True
+
+    monkeypatch.setattr(module, "refuse_if_batch_running",
+                        lambda force: guards.refuse_if_batch_running(force, pgrep=pgrep))
+    return looked
+
+
+def test_run_bench_refuses_to_start_while_the_batch_runs(tmp_path, monkeypatch):
+    clip, ckpt = clip_and_ckpt(tmp_path)
+    looked = batch_running_readers(monkeypatch, run_bench)
+    for argv in (["--base-only", "--name", "apple-base", clip], ["--ckpt", ckpt, "--name", "dn", "--device", "cpu", clip]):
+        with pytest.raises(SystemExit, match="refusing.*--force"):
+            run_bench.main(argv)
+    assert looked and not (tmp_path / "t-clip" / "out").exists()
+    looked.clear()
+    assert run_bench.main(["--base-only", "--name", "apple-base", "--force", clip]) == 0
+    assert looked == []  # --force does not even look
+    assert (tmp_path / "t-clip" / "out" / "apple-base.mkv").exists()
+
+
+def swap_readers(monkeypatch, module, used):
+    """The module's SwapGuard with the swap reader injected; -> the limits it was built with."""
+    limits = []
+    reads = iter(used)
+    monkeypatch.setattr(module, "SwapGuard",
+                        lambda limit: limits.append(limit) or SwapGuard(limit, read=lambda: next(reads)))
+    return limits
+
+
+def test_run_bench_checks_swap_before_each_clip_and_exits_3(tmp_path, monkeypatch, capsys):
+    for name in ("a", "b", "c"):
+        write_clip(tmp_path / name, synth(2), clip_spec(2, name=name))
+    limits = swap_readers(monkeypatch, run_bench, [1.0, 1.0, 20.0, 20.0])  # start, before a, before b
+    code = run_bench.main(["--base-only", "--name", "apple-base", *(str(tmp_path / n) for n in "abc")])
+    assert code == 3 and limits == [8.0]
+    assert (tmp_path / "a" / "out" / "apple-base.mkv").exists()
+    assert not (tmp_path / "b" / "out").exists() and not (tmp_path / "c" / "out").exists()
+    assert "swap" in capsys.readouterr().out
+
+
+def test_bench_dumps_refuses_to_start_while_the_batch_runs(tmp_path, monkeypatch):
+    binary = tmp_path / "metalfx-upscale"
+    binary.write_text("")
+    built = []
+    monkeypatch.setattr(bench_dumps, "build_clip", lambda clip_dir, binary: built.append(clip_dir.name))
+    looked = batch_running_readers(monkeypatch, bench_dumps)
+    with pytest.raises(SystemExit, match="refusing.*--force"):
+        bench_dumps.main([str(tmp_path / "a"), "--binary", str(binary)])
+    assert looked and built == []
+    looked.clear()
+    assert bench_dumps.main([str(tmp_path / "a"), "--binary", str(binary), "--force"]) == 0
+    assert looked == [] and built == ["a"]
+
+
+def test_bench_dumps_checks_swap_before_each_clip_and_exits_3(tmp_path, monkeypatch, capsys):
+    binary = tmp_path / "metalfx-upscale"
+    binary.write_text("")
+    built = []
+    monkeypatch.setattr(bench_dumps, "build_clip", lambda clip_dir, binary: built.append(clip_dir.name))
+    limits = swap_readers(monkeypatch, bench_dumps, [1.0, 1.0, 20.0, 20.0])
+    code = bench_dumps.main([str(tmp_path / n) for n in "abc"] + ["--binary", str(binary)])
+    assert code == 3 and limits == [8.0] and built == ["a"]
+    assert "swap" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------- bench_dumps
@@ -494,21 +668,21 @@ def test_pulse_ignores_empty_phases():
     assert metrics.jitter_phase([]) == [None] * 4 and metrics.pulse_of([None] * 4) is None
 
 
-def test_evaluate_reports_jitter_phase_and_pulse(tmp_path):
-    """End to end on a tiny synthetic clip: a smooth texture drifting 1 px a frame; the model output either follows
-    it or also flashes every 4th frame. Existing keys stay, the new ones appear, and the flashing output pulses."""
+def flashing_clip(tmp_path, n, cuts=(), flash_at=lambda t: t % 4 == 0):
+    """A tiny synthetic real clip: a smooth texture drifting 1 px a frame, the `steady` output following it, and the
+    `flash` output also 40 levels brighter at the frames where `flash_at(t)`."""
     from clipio import FFV1Writer
-    n, w, h = 17, 160, 120
+    w, h = 160, 120
     rng = np.random.default_rng(1)
     texture = (rng.random((h, w + n)).astype(np.float32))
     texture = np.stack([np.convolve(r, np.ones(5) / 5, mode="same") for r in texture])
     base = [np.repeat(np.clip(texture[:, t:t + w, None] * 255, 0, 255), 3, axis=2).astype(np.uint8) for t in range(n)]
     clip = tmp_path / "c-synth"
     (clip / "out").mkdir(parents=True)
-    (clip / "clip.json").write_text(json.dumps({"name": "c-synth", "kind": "real", "frames": n, "fps": 25.0, "cuts": [],
-                                                "lr_size": [w, h], "target": [w, h]}))
+    (clip / "clip.json").write_text(json.dumps({"name": "c-synth", "kind": "real", "frames": n, "fps": 25.0,
+                                                "cuts": list(cuts), "lr_size": [w, h], "target": [w, h]}))
     steady = [(f.astype(np.float32) * 0.8 + 5).astype(np.uint8) for f in base]  # differs from the bicubic, coherently
-    flash = [np.clip(f.astype(np.int16) + (40 if t % 4 == 0 else 0), 0, 255).astype(np.uint8)
+    flash = [np.clip(f.astype(np.int16) + (40 if flash_at(t) else 0), 0, 255).astype(np.uint8)
              for t, f in enumerate(steady)]
     for path, frames in ((clip / "lr.mkv", base), (clip / "out" / "steady.mkv", steady),
                          (clip / "out" / "flash.mkv", flash)):
@@ -516,12 +690,35 @@ def test_evaluate_reports_jitter_phase_and_pulse(tmp_path):
         for f in frames:
             wr.write(f)
         wr.close()
+    return clip
+
+
+def test_evaluate_reports_jitter_phase_and_pulse(tmp_path):
+    """End to end on a tiny synthetic clip: a smooth texture drifting 1 px a frame; the model output either follows
+    it or also flashes every 4th frame. Existing keys stay, the new ones appear, and the flashing output pulses."""
+    clip = flashing_clip(tmp_path, 17)
     results = {m: metrics.evaluate(clip, m) for m in ("steady", "flash")}
     for res in results.values():
         assert {"detail", "flicker", "jitter", "jitter_all", "flicker_pairs"} <= set(res)
         assert len(res["jitter_phase"]) == 4 and "pulse" in res
     assert results["steady"]["pulse"] < 1.15
     assert results["flash"]["pulse"] > results["steady"]["pulse"] + 0.2
+
+
+def test_pulse_phase_counts_frames_from_the_shot_start(tmp_path):
+    """A recurrent model restarts at every shot start, so its period-4 rhythm is in step with the shot, not the clip:
+    the phase of pair (t-1, t) is (t - shot start) mod 4. Here the second shot starts at frame 6 (6 mod 4 = 2, like
+    c-cut-nest's 75 mod 4 = 3) and the output flashes on frames 0, 4 of shot one and 6, 10, 14, ... of shot two. Pairs
+    ending on a flash or right after one are the jittery ones: phases 0 and 1 counted from the shot start. Counted from
+    the clip start, the long second shot would put them at phases 2 and 3 instead."""
+    starts = (0, 6)
+    clip = flashing_clip(tmp_path, 26, cuts=[6], flash_at=lambda t: (t - max(s for s in starts if s <= t)) % 4 == 0)
+    results = {m: metrics.evaluate(clip, m) for m in ("steady", "flash")}
+    phase = results["flash"]["jitter_phase"]
+    assert min(phase[0], phase[1]) > 1.5 * max(phase[2], phase[3]), phase
+    assert results["flash"]["pulse"] > results["steady"]["pulse"] + 0.2
+    assert results["flash"]["flicker_pairs"] == results["steady"]["flicker_pairs"]  # 24 pairs: the cut pair is skipped
+    assert sum(results["flash"]["flicker_pairs"].values()) == 24
 
 
 # ---------------------------------------------------------------- make_clips: gt3

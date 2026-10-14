@@ -1,6 +1,6 @@
 """Frame dumps of the bench clips, for running DetailNet on exactly the base Apple AI produces in the bench.
 
-    python -m detailnet.bench_dumps output/sr-bench/clips/c-* output/sr-bench/clips/g3-* [--binary PATH]
+    python -m detailnet.bench_dumps output/sr-bench/clips/c-* output/sr-bench/clips/g3-* [--binary PATH] [--force]
 
 Writes, per shot of each clip,
 
@@ -23,6 +23,9 @@ What is dumped:
 
 A finished shot directory is kept; a shot is built in a hidden `.shot<k>.tmp` directory and renamed once all three dumps
 check out, so an interrupted run leaves nothing half-written under a shot's name. Rerunning finishes the rest.
+
+Guards (the ml engine uses the GPU fully): refuses to start while the user's batch runs (`--force` overrides); stops with
+exit 3 before the next clip once swap grew by more than 8 GB.
 """
 import argparse
 import json
@@ -35,6 +38,7 @@ from typing import NamedTuple
 from detailnet.build_data import (FFMPEG_TIMEOUT_S, SWIFT_TIMEOUT_S, TMP_VIDEO, BuildError, run_checked,
                                   swift_cmd)
 from detailnet.dumps import read_meta
+from detailnet.guards import SWAP_EXIT_CODE, SwapGuard, SwapLimitExceeded, refuse_if_batch_running
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bench"))
@@ -46,6 +50,7 @@ DEFAULT_BINARY = ROOT / ".build-dev" / "release" / "metalfx-upscale"
 DUMP_KINDS = ("source", "base", "flow")
 CHANNELS = {"source": 3, "base": 3, "flow": 4}
 BITRATE_MBPS = 5  # of the throwaway video
+SWAP_LIMIT_GB = 8.0
 
 
 class DumpPlan(NamedTuple):
@@ -151,11 +156,19 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("clip_dirs", nargs="+", type=Path)
     ap.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help="the dev build of the Swift CLI")
+    ap.add_argument("--force", action="store_true", help="run even while the batch script is running")
     args = ap.parse_args(argv)
+    refuse_if_batch_running(args.force)
     if not args.binary.exists():
         sys.exit(f"{args.binary} not found: build it with `swift build -c release --scratch-path .build-dev`")
+    guard = SwapGuard(SWAP_LIMIT_GB)
     failed = 0
     for clip_dir in args.clip_dirs:
+        try:
+            guard.check()
+        except SwapLimitExceeded as error:
+            print(f"STOPPED by the swap guard before {clip_dir.name}: {error}. Rerun to resume.", flush=True)
+            return SWAP_EXIT_CODE
         try:
             build_clip(clip_dir, args.binary)
         except BuildError as error:

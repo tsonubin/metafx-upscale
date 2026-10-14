@@ -1,7 +1,7 @@
 """Run a trained DetailNet over the bench clips and write outputs `bench/metrics.py` can score.
 
     python -m detailnet.run_bench --ckpt output/detail-runs/r1/latest.pt --name dn-r1 [--strength 1.0] [--ignore-cuts]
-                                  [--device mps] output/sr-bench/clips/c-* output/sr-bench/clips/g3-*
+                                  [--device mps] [--force] output/sr-bench/clips/c-* output/sr-bench/clips/g3-*
     python -m detailnet.run_bench --base-only --name apple-base output/sr-bench/clips/c-* output/sr-bench/clips/g3-*
 
 Input is `python -m detailnet.bench_dumps CLIP_DIR...`: per shot, the source frames, Apple AI's x3 base and the optical
@@ -13,11 +13,12 @@ flow. Output is CLIP_DIR/out/NAME.mkv (lossless FFV1, like every bench output) a
                      center_crop true, out_size [1920, 1080];
     g3 clips         the full frame, 1920x1080 directly, center_crop false.
 
-The network is run the way it was trained (`detailnet.train.run_sequence`, rule R23). The state restarts (prev_detail and
-hidden zero, flow zero, x_prev = x_t) at the first frame of the run, at every shot start, and at every frame whose flow
-the dump marks invalid. Flow is cleaned like training data (non-finite -> 0, clamped to +-64 source px). The recurrence
-carries the raw detail; `strength` only scales what is added to the base in the output (compose), so strength 0 gives the
-base crop back exactly.
+The network is run with training's reset rule (R23). This loop is its own one-frame-at-a-time copy of the rule in
+`detailnet.train.run_sequence` (which runs a whole batch of sequences with masks); a test feeds both the same dumps and
+resets and requires the same details. The state restarts (prev_detail and hidden zero, flow zero, x_prev = x_t) at the
+first frame of the run, at every shot start, and at every frame whose flow the dump marks invalid. Flow is cleaned like
+training data (non-finite -> 0, clamped to +-64 source px). The recurrence carries the raw detail; `strength` only
+scales what is added to the base in the output (compose), so strength 0 gives the base crop back exactly.
 
 --ignore-cuts is the cut-leak measurement (bench/metrics.py compares NAME-nocut against NAME). At a shot start the state is
 carried over instead: the flow is zero there (a shot start has no flow), x_prev is the previous frame, and prev_detail and
@@ -31,6 +32,13 @@ with identical frames (cut leak 0), which only exists so `gates.py apple-base` c
 
 `frame_pixels` is the 4x-equivalent pixel count of the processed region (16 x LR pixels), the unit `bench/run_model.py`
 uses for its 4x models, so `bench/summarize.py` scales the seconds per frame to a full 720p frame correctly.
+
+--name may not be one of the bench's own outputs (apple, gt, bicubic, realesrgan, realesrgan-general, realbasicvsr,
+realviformer, flashvsr*), whose files it would overwrite, nor end in -nocut (--ignore-cuts adds that); apple-base only
+with --base-only.
+
+Guards (GPU-heavy, like training): refuses to start while the user's batch runs (`--force` overrides); stops with exit 3
+before the next clip once swap grew by more than 8 GB (the clips already written are complete).
 """
 import argparse
 import json
@@ -45,13 +53,32 @@ from detailnet.bench_dumps import CROP, check_shot, dump_plan  # also puts bench
 from detailnet.build_data import BuildError
 from detailnet.data import clean_flow
 from detailnet.dumps import read_flow, read_frame, read_meta
+from detailnet.guards import SWAP_EXIT_CODE, SwapGuard, SwapLimitExceeded, refuse_if_batch_running
 from detailnet.model import compose
 from clipio import FFV1Writer  # noqa: E402
 from run_model import crop_plan  # noqa: E402
 
 
+SWAP_LIMIT_GB = 8.0
+BASE_NAME = "apple-base"  # the --base-only reference of bench/gates.py
+RESERVED_NAMES = ("apple", "gt", "bicubic", "realesrgan", "realesrgan-general", "realbasicvsr", "realviformer")
+RESERVED_PREFIXES = ("flashvsr",)  # flashvsr, flashvsr-full, flashvsr-c960, ...
+
+
 class DumpError(RuntimeError):
     """The clip's dumps are missing, unfinished or do not match its clip.json."""
+
+
+def name_problem(name, base_only):
+    """Why `name` cannot be a run_bench output name (None if it can): it would overwrite a bench output or the
+    reference, or it is not a plain name."""
+    if "/" in name or name.endswith("-nocut"):
+        return "must be a plain model name (no slash, no -nocut suffix: --ignore-cuts adds it)"
+    if name in RESERVED_NAMES or name.startswith(RESERVED_PREFIXES):
+        return "is a bench output's name; its files would be overwritten"
+    if name == BASE_NAME and not base_only:
+        return "is reserved for the --base-only reference of bench/gates.py"
+    return None
 
 
 class Shot:
@@ -239,12 +266,16 @@ def main(argv=None):
     ap.add_argument("--strength", type=float, default=1.0)
     ap.add_argument("--ignore-cuts", action="store_true", help="carry state across shot starts; writes NAME-nocut")
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--force", action="store_true", help="run even while the batch script is running")
     args = ap.parse_args(argv)
-    if "/" in args.name or args.name.endswith("-nocut"):
-        ap.error("--name must be a plain model name (no slash, no -nocut suffix)")
+    problem = name_problem(args.name, args.base_only)
+    if problem:
+        ap.error(f"--name {args.name} {problem}")
     if args.base_only == (args.ckpt is not None):
         ap.error("give --ckpt to run DetailNet, or --base-only for the Apple AI base without a network, not both or neither")
 
+    refuse_if_batch_running(args.force)
+    guard = SwapGuard(SWAP_LIMIT_GB)
     if args.base_only:
         net = None
     else:
@@ -252,6 +283,12 @@ def main(argv=None):
         net, _ = load_checkpoint(args.ckpt)
     failed = 0
     for clip_dir in args.clip_dirs:
+        try:
+            guard.check()
+        except SwapLimitExceeded as error:
+            print(f"STOPPED by the swap guard before {clip_dir.name}: {error}. Rerun for the remaining clips.",
+                  flush=True)
+            return SWAP_EXIT_CODE
         try:
             stats = run_clip(net, clip_dir, args.name, args.strength, args.ignore_cuts, args.device, args.ckpt)
         except DumpError as error:

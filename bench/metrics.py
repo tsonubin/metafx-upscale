@@ -17,8 +17,10 @@ that straddle a scene cut are skipped.
                change). Reported per motion bucket of the pair (static <0.3, slow <2,
                fast ≥2 px/frame at 720p scale).
   flicker      the same numerator without the normalisation (luma levels, 0–255).
-  jitter_phase mean jitter of pair t (the pair (t-1, t), inside one shot) grouped by t mod 4: a list of 4
-               floats, null where no pair falls in that phase.
+  jitter_phase mean jitter of pair t (the pair (t-1, t), inside one shot) grouped by (t - shot start) mod 4:
+               a list of 4 floats, null where no pair falls in that phase. Counted from the shot start because a
+               recurrent model restarts at every cut, so its rhythm is in step with the shot (c-cut-nest's second
+               shot starts at frame 75).
   pulse        max ÷ mean of the non-null jitter_phase entries: ~1 for steady output, above 1 when the
                jitter breathes with a period of 4 frames (a recurrent texture generator that re-seeds or
                rebuilds its detail every few frames); null without pairs.
@@ -119,8 +121,9 @@ def bucket_of(speed):
 
 
 def jitter_phase(pairs, period=PULSE_PERIOD):
-    """Mean jitter per phase: `pairs` is an iterable of (t, jitter) for the pairs (t-1, t) that were scored; the result
-    is a list of `period` means over t % period, None where no pair has that phase."""
+    """Mean jitter per phase: `pairs` is an iterable of (t, jitter) for the pairs (t-1, t) that were scored, with t
+    counted from the pair's shot start (evaluate passes t - shot start); the result is a list of `period` means over
+    t % period, None where no pair has that phase."""
     sums = [[] for _ in range(period)]
     for t, value in pairs:
         sums[t % period].append(value)
@@ -180,8 +183,10 @@ def evaluate(clip_dir, model, max_frames=None, region=None):
     dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
     lr_gray = [cv2.cvtColor(f, cv2.COLOR_RGB2GRAY) for f in lr]
     shot_of = np.zeros(n, int)
+    shot_start = np.zeros(n, int)
     for k, (a, b) in enumerate(shots_of(clip)):
         shot_of[a:b] = k
+        shot_start[a:b] = a
     scorer = LPIPSScorer() if has_gt else None
 
     src = out_path if model != "gt" else gt_path
@@ -193,7 +198,7 @@ def evaluate(clip_dir, model, max_frames=None, region=None):
 
     per_bucket = {name: [] for name, _, _ in BUCKETS}
     jitter = {name: [] for name, _, _ in BUCKETS}
-    pair_jitter = []  # (t, normalised jitter) of every scored pair, for the period-4 profile
+    pair_jitter = []  # (t - shot start, normalised jitter) of every scored pair, for the period-4 profile
     detail, psnr, lp, ds, tlp = [], [], [], [], []
     prev = prev_bic = prev_gt = None
     for t in range(n):
@@ -222,7 +227,7 @@ def evaluate(clip_dir, model, max_frames=None, region=None):
                 per_bucket[bucket_of(speed)].append(num)
                 jit = num / max(float(grad_map(y)[mask].mean()), 1e-6)
                 jitter[bucket_of(speed)].append(jit)
-                pair_jitter.append((t, jit))
+                pair_jitter.append((int(t - shot_start[t]), jit))
             if has_gt:
                 tlp.append(abs(scorer.lpips(out, prev_out_img) - scorer.lpips(gt, prev_gt)) * 100)
         prev, prev_bic, prev_out_img, prev_gt = y, bic, out, gt
