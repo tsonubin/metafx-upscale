@@ -26,10 +26,14 @@ class Perceptual(nn.Module):
     def train(self, mode=True):
         return super().train(False)  # always eval: the metrics are fixed measuring sticks
 
-    def forward(self, pred, target):
+    def per_item(self, pred, target):
+        """(N,) DISTS + LPIPS of each item; both are per-image, so an item's value does not depend on the others."""
         dists = self.dists(pred, target, require_grad=True).reshape(-1)  # DISTS squeezes a batch of 1
         lp = self.lpips(2.0 * pred - 1.0, 2.0 * target - 1.0).reshape(-1)  # LPIPS wants [-1, 1]
-        return (dists + lp).mean()
+        return dists + lp
+
+    def forward(self, pred, target):
+        return self.per_item(pred, target).mean()
 
 
 def texture_lock(d_t, d_prev, back_flow_hr, mask_hr):

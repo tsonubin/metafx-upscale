@@ -1,7 +1,7 @@
 import pytest
 
-from detailnet.guards import (SwapGuard, SwapLimitExceeded, batch_running, parse_swap_used_gb,
-                              refuse_if_batch_running)
+from detailnet.guards import (BATCH_EXIT_CODE, BatchGuard, BatchStarted, SwapGuard, SwapLimitExceeded, batch_running,
+                              parse_swap_used_gb, refuse_if_batch_running)
 
 GB = 1.0
 
@@ -86,7 +86,36 @@ def test_swap_limit_exceeded_is_an_exception():
     assert issubclass(SwapLimitExceeded, Exception)
 
 
+def test_batch_guard_raises_once_the_batch_runs():
+    running = [False]
+    seen = []
+
+    def pgrep(pattern):
+        seen.append(pattern)
+        return running[0]
+
+    guard = BatchGuard(False, pgrep=pgrep)
+    guard.check()
+    running[0] = True
+    with pytest.raises(BatchStarted) as stopped:
+        guard.check()
+    assert "batch-upscale.sh" in str(stopped.value)
+    assert seen == ["scripts/batch-upscale.sh"] * 2  # it looks on every check
+
+
+def test_batch_guard_with_force_never_looks():
+    guard = BatchGuard(True, pgrep=lambda pattern: pytest.fail("force must not even look"))
+    guard.check()
+    guard.check()
+
+
+def test_batch_stop_exits_3_like_the_swap_guard():
+    assert BATCH_EXIT_CODE == 3
+    assert issubclass(BatchStarted, Exception) and not issubclass(BatchStarted, SwapLimitExceeded)
+
+
 def test_real_readers_run_on_this_machine():
     # Not a check of the numbers, only that the default readers work here.
     assert isinstance(batch_running(), bool)
     SwapGuard().check()
+    BatchGuard(True).check()

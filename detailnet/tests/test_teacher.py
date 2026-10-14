@@ -10,7 +10,7 @@ import pytest
 
 from detailnet import teacher
 from detailnet.dumps import DumpWriter, read_frame, read_meta
-from detailnet.guards import SwapGuard, SwapLimitExceeded
+from detailnet.guards import BatchGuard, SwapGuard, SwapLimitExceeded
 from detailnet.teacher import (acquire_lock, is_done, is_ready, make_teacher, release_lock, round_robin, run_all,
                                to_teacher_grid, to_uint8_hwc)
 
@@ -376,6 +376,41 @@ def test_swap_guard_stops_the_run_with_exit_3(tmp_path):
     assert lines[-1].startswith("SUMMARY incomplete") and lines[-1].endswith("exit 3")
 
 
+def batch_from_look(n):
+    """A BatchGuard whose pgrep says the batch runs from the n-th look on; -> (guard, looks)."""
+    looked = []
+
+    def pgrep(pattern):
+        looked.append(pattern)
+        return len(looked) >= n
+
+    return BatchGuard(False, pgrep=pgrep), looked
+
+
+def test_the_batch_starting_stops_the_run_between_sequences_with_exit_3(tmp_path):
+    """The batch is looked for before each sequence, so the one being made is finished first (a partial teacher/ is
+    removed on any interruption anyway, R13) and the run stops with exit 3; a rerun resumes."""
+    recs = make_data(tmp_path, ["static", "slow", "fast", "local"])
+    batch, looked = batch_from_look(3)
+    lines = []
+    code, counts = run_all(tmp_path, Fake(), None, Guard(), lines.append, batch=batch)
+    assert code == 3 and counts["made"] == 2 and len(looked) == 3
+    assert sum(is_done(tmp_path / "teacher" / f"{r['id']:05d}", r) for r in recs) == 2
+    assert all(not (tmp_path / "teacher" / f"{r['id']:05d}" / "teacher").exists() or
+               is_done(tmp_path / "teacher" / f"{r['id']:05d}", r) for r in recs)  # nothing half-made
+    assert any("batch" in line and "STOPPED" in line for line in lines)
+    assert lines[-1].startswith("SUMMARY incomplete") and lines[-1].endswith("exit 3")
+    code, counts = run_all(tmp_path, Fake(), None, Guard(), lambda line: None, batch=batch_from_look(99)[0])
+    assert code == 0 and counts["made"] == 2 and counts["already_done"] == 2
+
+
+def test_with_force_the_batch_is_never_looked_for(tmp_path):
+    make_data(tmp_path, ["static", "slow"])
+    batch = BatchGuard(True, pgrep=lambda pattern: pytest.fail("force must not even look"))
+    code, counts = run_all(tmp_path, Fake(), None, Guard(), lambda line: None, batch=batch)
+    assert code == 0 and counts["made"] == 2
+
+
 def test_failures_are_logged_and_exit_1_but_do_not_stop_the_run(tmp_path):
     recs = make_data(tmp_path, ["static", "slow", "fast"])
     lines = []
@@ -451,8 +486,10 @@ def test_release_leaves_a_lock_that_belongs_to_someone_else(tmp_path):
 @pytest.fixture
 def fake_main(tmp_path, monkeypatch):
     """main() with the batch check recorded, the swap read fixed, and the FlashVSR loader replaced."""
-    state = {"forced": [], "loaded": 0, "fake": Fake()}
+    state = {"forced": [], "loaded": 0, "fake": Fake(), "batch_forced": []}
     monkeypatch.setattr(teacher, "refuse_if_batch_running", lambda force: state["forced"].append(force))
+    monkeypatch.setattr(teacher, "BatchGuard", lambda force: state["batch_forced"].append(force) or
+                        BatchGuard(force, pgrep=lambda pattern: False), raising=False)
     monkeypatch.setattr(teacher, "SwapGuard", lambda limit: SwapGuard(limit, read=lambda: 1.0))
 
     def load():
@@ -480,7 +517,17 @@ def test_main_does_not_load_the_model_when_there_is_nothing_to_do(tmp_path, fake
 def test_main_force_skips_the_batch_check(tmp_path, fake_main):
     make_data(tmp_path, ["static"])
     teacher.main(["--data", str(tmp_path), "--force"])
-    assert fake_main["forced"] == [True]
+    assert fake_main["forced"] == [True] and fake_main["batch_forced"] == [True]
+
+
+def test_main_exits_3_when_the_batch_starts_and_releases_the_lock(tmp_path, fake_main, monkeypatch):
+    make_data(tmp_path, ["static", "slow", "fast"])
+    looks = []
+    monkeypatch.setattr(teacher, "BatchGuard",
+                        lambda force: BatchGuard(force, pgrep=lambda pattern: looks.append(1) or len(looks) >= 2))
+    assert teacher.main(["--data", str(tmp_path)]) == 3
+    assert len(fake_main["fake"].calls) == 1  # the first sequence was finished, the second never started
+    assert not (tmp_path / "teacher.lock").exists()
 
 
 def test_main_refuses_while_the_batch_runs(tmp_path, monkeypatch, fake_main):

@@ -17,9 +17,11 @@ Order is round-robin over the motion buckets (static, slow, fast, local, straddl
 bucket, so a run stopped halfway still covers every bucket evenly. A sequence whose build is not finished yet is left
 for later (rerun, or it is picked up when the run finishes the others and looks again).
 
-Guards: refuses to start while the user's batch runs (`--force` overrides); one instance at a time (`<data>/teacher.lock`
-holds the pid; a lock of a dead process is taken over); stops with exit 3 when swap grew by more than 8 GB (resumable);
-five failures in a row stop the run with exit 1. Progress goes to stdout, one line per sequence, ending in a SUMMARY.
+Guards: refuses to start while the user's batch runs (`--force` overrides), and looks again before each sequence: once
+the batch runs, the run stops with exit 3 after the sequence in hand is finished (resumable); one instance at a time
+(`<data>/teacher.lock` holds the pid; a lock of a dead process is taken over); stops with exit 3 when swap grew by more
+than 8 GB (resumable); five failures in a row stop the run with exit 1. Progress goes to stdout, one line per sequence,
+ending in a SUMMARY.
 """
 import argparse
 import json
@@ -35,7 +37,8 @@ import numpy as np
 
 from detailnet.build_data import expected_frames, hms, is_complete
 from detailnet.dumps import DumpWriter, read_frame, read_meta
-from detailnet.guards import SWAP_EXIT_CODE, SwapGuard, SwapLimitExceeded, refuse_if_batch_running
+from detailnet.guards import (BATCH_EXIT_CODE, SWAP_EXIT_CODE, BatchGuard, BatchStarted, SwapGuard, SwapLimitExceeded,
+                              refuse_if_batch_running)
 from detailnet.sampling import BUCKETS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,9 +156,10 @@ def load_entries(data):
 
 # ---------------------------------------------------------------- the run
 
-def run_all(data, upscale, limit, guard, log=print):
+def run_all(data, upscale, limit, guard, log=print, batch=None):
     """Make teacher targets for every finished, undone teacher sequence of `data`, round-robin over the buckets.
-    `limit` caps the number of sequences made this run. Returns (exit code, counts)."""
+    `limit` caps the number of sequences made this run. `guard` (swap) and `batch` (the user's batch; a BatchGuard,
+    or None for no check) are checked before each sequence. Returns (exit code, counts)."""
     entries = load_entries(data)
     total = len(entries)
     done = sum(is_done(seq_dir(data, e), e) for e in entries)
@@ -176,6 +180,14 @@ def run_all(data, upscale, limit, guard, log=print):
             except SwapLimitExceeded as error:
                 log(f"STOPPED by the swap guard before teacher {entry['id']:05d}: {error}. Rerun to resume.")
                 code = SWAP_EXIT_CODE
+                break
+            try:
+                if batch is not None:
+                    batch.check()
+            except BatchStarted as error:
+                log(f"STOPPED for the batch before teacher {entry['id']:05d}: {error}. Rerun once it is done "
+                    "(or with --force) to resume.")
+                code = BATCH_EXIT_CODE
                 break
             attempted.add(entry["id"])
             number += 1
@@ -320,7 +332,7 @@ def main(argv=None):
         print(f"teacher targets for {data} (pid {os.getpid()}, limit {args.limit}, swap limit "
               f"{args.swap_limit_gb:g} GB)", flush=True)
         code, _ = run_all(data, lazy(load_flashvsr), args.limit, guard,
-                          log=lambda line: print(line, flush=True))
+                          log=lambda line: print(line, flush=True), batch=BatchGuard(args.force))
         return code
     finally:
         release_lock(lock)

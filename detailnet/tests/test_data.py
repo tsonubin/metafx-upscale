@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from detailnet import data as data_module
 from detailnet.data import SequenceDataset
 from detailnet.dumps import DumpWriter
 
@@ -257,7 +258,8 @@ def test_short_burn_in_is_front_padded(tmp_path):
 def test_no_burn_in_is_all_padding(tmp_path):
     item = dataset(tmp_path, [record(0, burn_in=0, cuts=[5])])[0]
     assert frame_ids(item["x"]) == [0] * N_BURN + list(range(12))
-    assert item["loss_mask"].tolist() == [False] * N_BURN + [True] * N_LOSS
+    # R34: a teacher item does not score dumped frames 5..8 (slots 13..16), the first four from the cut
+    assert item["loss_mask"].tolist() == [False] * N_BURN + [True] * 5 + [False] * 4 + [True] * 3
     assert item["reset"].tolist() == [i <= N_BURN or i == N_BURN + 5 for i in range(20)]
     assert item["flow"][:N_BURN].abs().sum() == 0
 
@@ -271,7 +273,8 @@ def test_long_sequence_takes_a_random_loss_window_with_its_own_burn_in(tmp_path)
         ids = frame_ids(item["x"])
         start = ids[N_BURN]  # first loss frame
         assert ids == list(range(start - N_BURN, start + N_LOSS))  # the 8 dumped frames before it, then 12
-        assert item["loss_mask"].tolist() == [False] * N_BURN + [True] * N_LOSS
+        # R34: dumped frames 20..23, the first four from the cut, are not scored wherever the window puts them
+        assert item["loss_mask"].tolist() == [i >= N_BURN and not 20 <= ids[i] < 24 for i in range(20)]
         assert item["reset"].tolist() == [i == 0 or ids[i] == 20 for i in range(20)]  # window start, and the cut
         starts.add(start)
     assert starts == set(range(N_BURN, 32 - N_LOSS + 1))  # 8..20: every 12-frame window of the 24 loss frames
@@ -290,6 +293,67 @@ def test_long_sequence_near_the_start_is_padded(tmp_path):
         assert item["reset"].tolist() == [i <= pads for i in range(20)]
         seen[start] = pads
     assert seen[2] == 6 and seen[8] == 0 and set(seen) == set(range(2, 15))
+
+
+# ---------------------------------------------------------------- R34: teacher frames right after a cut
+
+def scored(item):
+    return [i for i, v in enumerate(item["loss_mask"].tolist()) if v]
+
+
+def test_teacher_items_do_not_score_the_four_frames_from_a_cut(tmp_path):
+    """FlashVSR made the teacher targets of a straddle sequence as one shot across its cut, so they lag for a few
+    frames after it: the cut frame and the three after it are not scored (R34)."""
+    assert data_module.CUT_MASK_FRAMES == 4
+    item = dataset(tmp_path, [record(0, cuts=[11])])[0]
+    assert scored(item) == [8, 9, 10] + list(range(15, 20))
+    assert item["reset"].tolist() == [i in (0, 11) for i in range(20)]  # resets are unchanged
+
+
+@pytest.mark.parametrize("cut,frames", [(18, [18, 19]), (19, [19]), (6, [8, 9]), (2, [])])
+def test_the_four_frames_are_cut_short_by_the_item_s_edges(tmp_path, cut, frames):
+    item = dataset(tmp_path, [record(0, cuts=[cut])])[0]
+    assert scored(item) == [i for i in range(N_BURN, 20) if i not in frames]
+
+
+def test_two_cuts_each_mask_their_frames(tmp_path):
+    item = dataset(tmp_path, [record(0, cuts=[9, 16])])[0]
+    assert scored(item) == [8, 13, 14, 15]
+
+
+def test_gt_items_score_every_loss_frame_across_a_cut(tmp_path):
+    item = dataset(tmp_path, [record(0, "gt", cuts=[11])], kind="gt")[0]
+    assert item["loss_mask"].tolist() == [False] * N_BURN + [True] * N_LOSS
+    assert item["reset"][11]
+
+
+def test_ping_pong_mirrors_the_frames_after_a_cut(tmp_path):
+    item = dataset(tmp_path, [record(0, cuts=[11])], ping_pong=True)[0]
+    mask = item["loss_mask"].tolist()
+    assert [i for i in range(20) if mask[i]] == [8, 9, 10] + list(range(15, 20))
+    for j in range(19):  # the reversed frame is original 18 - j and keeps its mask
+        assert mask[20 + j] == mask[18 - j]
+    assert not any(mask[20 + (18 - k)] for k in (11, 12, 13, 14))
+
+
+def test_ping_pong_on_a_padded_teacher_item_with_a_cut(tmp_path):
+    item = dataset(tmp_path, [record(0, burn_in=3, cuts=[6])], ping_pong=True)[0]
+    pads = N_BURN - 3  # dumped frame d sits in slot d + pads: the cut's frames 6..9 are slots 11..14
+    mask = item["loss_mask"].tolist()
+    assert [i for i in range(20) if mask[i]] == [8, 9, 10] + list(range(15, 20))
+    assert all(mask[20 + j] == mask[18 - j] for j in range(19)) and pads == 5
+
+
+def test_random_reset_only_lands_on_a_scored_frame(tmp_path):
+    ds = dataset(tmp_path, [record(0, cuts=[11])], reset_prob=1.0)
+    slots = set()
+    for seed in range(200):
+        ds.seed = seed
+        item = ds[0]
+        extra = [i for i in range(20) if item["reset"][i] and i not in (0, 11)]
+        assert len(extra) == 1 and item["loss_mask"][extra[0]]
+        slots.add(extra[0])
+    assert slots == {8, 9, 10, 15, 16, 17, 18, 19}
 
 
 # ---------------------------------------------------------------- ping-pong

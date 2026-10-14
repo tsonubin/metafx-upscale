@@ -11,7 +11,8 @@ One item is a random sub-crop of one sequence, a stack of T frames the recurrent
     flow     (T, 4, h, w)       [back_x, back_y, fwd_x, fwd_y] in source px of the crop grid, clamped to +-64
     target   (T, 3, 3h, 3w)     teacher (FlashVSR) or ground-truth frames of the same crop
     reset    (T,) bool          the network's state starts from zero at this frame
-    loss_mask(T,) bool          the frame is scored (False for burn-in and padding)
+    loss_mask(T,) bool          the frame is scored (False for burn-in and padding, and in teacher items for the
+                                first frames from each cut, see below)
     kind     "teacher" | "gt";  seq_id  the sequence's id in sequences.json (for debugging)
 
 Time layout. T = 8 burn-in slots + 12 loss frames = 20 (39 with ping-pong), the same for every item so batches
@@ -25,11 +26,17 @@ sequence's spec, every frame whose flow is marked invalid, and, with probability
 loss frame (so the network also learns to start cold mid-clip). Flow across a hard cut is *not* marked invalid by the
 dumps; the spec's cuts are what makes it reset there.
 
+Teacher frames after a cut (ruling R34). FlashVSR made a straddle sequence's teacher targets as one shot across its cut,
+so they lag behind the new shot for a few frames. In teacher items the dumped frames c, c+1, c+2, c+3 of every cut c in
+the spec are therefore not scored (loss_mask False) wherever they fall in the item, which may cut the four frames short
+at the item's edges. gt items are unaffected (their targets are the real frames). Resets are unchanged.
+
 Ping-pong appends the item's frames in reverse, without repeating the last one: slots 0..19 then 18..0. The reversed
 frame that is original frame t-1, following original frame t, takes the flow stored at original index t with its
 channels swapped (back <- fwd_t, since fwd_t is the displacement t-1 -> t on frame t-1's grid, which is exactly "back"
 for a sequence that visits t first; fwd <- back_t), resets when original t is a cut or has invalid flow, and keeps the
-loss_mask of original frame t-1. Pads keep zero flow and reset.
+loss_mask of original frame t-1 (so R34's unscored frames are mirrored). Pads keep zero flow and reset. The random reset
+is drawn last, among the scored frames of the whole item.
 
 Randomness: every item draws from its own `np.random.default_rng(seed + index)` (crop position, loss window, random
 reset), so an item is a pure function of (seed, index) and nothing touches a global generator. Because of that an item
@@ -61,6 +68,7 @@ MARGIN = CROP_MARGIN  # source px of context around the central crop in the dump
 BURN_IN = 8  # burn-in slots in every item
 LOSS = 12  # scored frames in every item
 FLOW_LIMIT = 64.0  # flow is clamped to +-this many source px
+CUT_MASK_FRAMES = 4  # R34: teacher frames not scored from each cut on (the cut frame and the 3 after it)
 TARGET_DIR = {"teacher": "teacher", "gt": "target"}
 
 
@@ -174,6 +182,10 @@ class SequenceDataset(torch.utils.data.Dataset):
         reset = natural.copy()
         reset[pads] = True
         loss_mask = np.arange(BURN_IN + LOSS) >= BURN_IN
+        if self.kind == "teacher" and seq.cuts:  # R34: the teacher lags behind a cut it ran across
+            dumped = [real[i - pads] if i >= pads else None for i in range(BURN_IN + LOSS)]
+            lagging = np.array([d is not None and any(c <= d < c + CUT_MASK_FRAMES for c in seq.cuts) for d in dumped])
+            loss_mask &= ~lagging
 
         if self.ping_pong:
             back = np.arange(BURN_IN + LOSS - 2, -1, -1)  # original slots 18..0, in the order they are replayed
@@ -188,7 +200,8 @@ class SequenceDataset(torch.utils.data.Dataset):
 
         if reset_draw < self.reset_prob:
             scored = np.flatnonzero(loss_mask)
-            reset[scored[int(reset_pick * len(scored))]] = True
+            if len(scored):
+                reset[scored[int(reset_pick * len(scored))]] = True
 
         item = {name: torch.from_numpy(a).to(torch.float32) for name, a in arrays.items()}
         item.update(reset=torch.from_numpy(reset), loss_mask=torch.from_numpy(loss_mask), kind=self.kind,

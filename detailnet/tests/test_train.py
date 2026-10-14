@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from detailnet import train as tr
-from detailnet.guards import SwapLimitExceeded
+from detailnet.guards import BatchGuard, BatchStarted, SwapLimitExceeded
 from detailnet.losses import Perceptual, ping_pong, texture_lock
 from detailnet.model import DetailNet, compose, upsample_flow
 from detailnet.tests.test_data import CROP, make_data, record
@@ -43,6 +43,8 @@ class QuietGuard:
 @pytest.fixture(autouse=True)
 def quiet_swap_guard(monkeypatch):
     monkeypatch.setattr(tr, "SwapGuard", QuietGuard)
+    # no batch running, whatever this machine is doing (tests of the batch check inject their own reader)
+    monkeypatch.setattr(tr, "BatchGuard", lambda force: BatchGuard(force, pgrep=lambda pattern: False), raising=False)
 
 
 def synthetic_batch(n=1, t=4, loss_from=2, kind="gt", seed=0, resets=(0,), h=H, w=W):
@@ -160,10 +162,60 @@ def test_resume_continues_iter(tmp_path):
     assert iters == [1, 2, 3, 4, 5]
 
 
-def test_resume_without_a_checkpoint_starts_fresh(tmp_path):
+def test_resume_without_a_checkpoint_is_an_error(tmp_path, monkeypatch, capsys):
+    """A mistyped --out with --resume must not quietly start a new run from scratch."""
     fake_data(tmp_path)
-    last = tr.train(cfg_for(tmp_path, iters=2, resume=True))
-    assert last.name == "ckpt_000002.pt"
+    with pytest.raises(FileNotFoundError, match="latest.pt.*--resume"):
+        tr.train(cfg_for(tmp_path, iters=2, resume=True))
+    assert not Path(cfg_for(tmp_path).out).exists()
+    monkeypatch.setattr(tr, "refuse_if_batch_running", lambda force: None)
+    code = tr.main(["--data", str(tmp_path / "data"), "--out", str(tmp_path / "nope"), "--resume", "--device", "cpu"])
+    assert code == 1 and "latest.pt" in capsys.readouterr().out
+    assert not (tmp_path / "nope").exists()
+
+
+def test_init_from_starts_a_new_run_from_the_checkpoints_weights(tmp_path):
+    """--init-from: the weights of a checkpoint, a fresh optimizer, iteration 0, so the cosine schedule starts over
+    for the new --iters (the tuning rounds: --init-from r1/latest.pt --iters 30000 --out r2)."""
+    fake_data(tmp_path)
+    tr.train(cfg_for(tmp_path, iters=3, ckpt_every=10))
+    r1 = Path(cfg_for(tmp_path).out) / "latest.pt"
+    first = torch.load(r1, map_location="cpu", weights_only=True)
+    # lr 0: nothing moves, so the new run's weights are exactly the loaded ones
+    frozen = cfg_for(tmp_path, out=str(tmp_path / "r2-frozen"), iters=2, lr=0.0, ckpt_every=10, init_from=str(r1))
+    tr.train(frozen)
+    still = torch.load(Path(frozen.out) / "latest.pt", map_location="cpu", weights_only=True)
+    assert all(torch.equal(still["model"][k], v) for k, v in first["model"].items())
+    # a real run: its own iteration count, optimizer and schedule
+    base, iters = 1e-3, 2
+    cfg = cfg_for(tmp_path, out=str(tmp_path / "r2"), iters=iters, lr=base, ckpt_every=10, init_from=str(r1))
+    assert tr.train(cfg).name == "ckpt_000002.pt"
+    second = torch.load(Path(cfg.out) / "latest.pt", map_location="cpu", weights_only=True)
+    assert second["iter"] == 2 and second["opt"]["state"][0]["step"] == 2  # not 3 + 2: a fresh optimizer
+    assert second["cfg"]["init_from"] == str(r1)
+    rows = read_log(cfg)
+    assert [r["iter"] for r in rows] == [1, 2]
+    assert rows[0]["lr"] == pytest.approx(base) and rows[1]["lr"] == pytest.approx(want_lr(base, 1, iters), rel=1e-5)
+    assert not torch.equal(second["model"]["head_hid.bias"], first["model"]["head_hid.bias"])
+
+
+def test_init_from_refuses_resume_and_existing_runs(tmp_path, monkeypatch, capsys):
+    fake_data(tmp_path)
+    tr.train(cfg_for(tmp_path, iters=1))
+    r1 = str(Path(cfg_for(tmp_path).out) / "latest.pt")
+    with pytest.raises(ValueError, match="--init-from.*--resume"):
+        tr.train(cfg_for(tmp_path, out=str(tmp_path / "r2"), iters=2, resume=True, init_from=r1))
+    with pytest.raises(FileExistsError):  # into a run directory that already has a latest.pt
+        tr.train(cfg_for(tmp_path, iters=2, init_from=r1))
+    with pytest.raises(FileNotFoundError, match="nope.pt"):
+        tr.train(cfg_for(tmp_path, out=str(tmp_path / "r3"), iters=2, init_from=str(tmp_path / "nope.pt")))
+    with pytest.raises(ValueError, match="channels"):
+        tr.train(cfg_for(tmp_path, out=str(tmp_path / "r4"), iters=2, init_from=r1, channels=16))
+    assert not any((tmp_path / name).exists() for name in ("r2", "r3", "r4"))
+    monkeypatch.setattr(tr, "refuse_if_batch_running", lambda force: None)
+    with pytest.raises(SystemExit):
+        tr.main(["--data", str(tmp_path / "data"), "--out", str(tmp_path / "r5"), "--resume", "--init-from", r1])
+    assert "--init-from" in capsys.readouterr().err and not (tmp_path / "r5").exists()
 
 
 def test_resume_refuses_a_different_architecture(tmp_path):
@@ -385,6 +437,194 @@ def test_losses_only_see_loss_mask_frames(perceptual):
     mc = tr.compute_gradients(model, perceptual, c, cfg, rng=np.random.default_rng(0))
     assert mb["perc"] == pytest.approx(ma["perc"]) and mb["l1"] == pytest.approx(ma["l1"])
     assert mc["perc"] != pytest.approx(ma["perc"])
+
+
+# ---------------------------------------------------------------- per-item loss masks (R34)
+
+def mixed_mask_batch(kind="teacher", pingpong=False):
+    """Two items that score different frames, as R34 makes them: item 1 has a cut at frame 3 of 6 (slot 11 of a
+    ping-pong item, mirrored) and does not score the frames from it."""
+    if pingpong:
+        b = pingpong_batch(kind=kind, n=2)
+        lagging = [11, 12, 13, 14]
+        b["loss_mask"][1, lagging] = False
+        b["loss_mask"][1, [38 - k for k in lagging]] = False
+        b["reset"][1, [11, 27]] = True  # the cut, and the reversed frame that follows it
+    else:
+        b = synthetic_batch(n=2, t=6, loss_from=2, kind=kind, resets=(0,))
+        b["loss_mask"][1, 3:5] = False
+        b["reset"][1, 3] = True
+    return b
+
+
+def direct_per_item(model, perceptual, batch, cfg, pingpong, plan=None):
+    """The loss written out per (item, frame): every term is the mean over the frames each item's own loss_mask
+    scores, the perceptual term one item at a time (with `plan`, {frame: [(item, weight)]}, the weighted sum over the
+    plan's pairs instead); one backward through everything."""
+    model.zero_grad()
+    mask = batch["loss_mask"]
+    n, t = mask.shape
+    x_prev, flow = tr.prepare_inputs(batch["x"], batch["flow"], batch["reset"])
+    details = tr.run_sequence(model, batch["x"], batch["base"], batch["flow"], batch["reset"])
+    outs = [compose(batch["base"][:, k], details[k], 1.0) for k in range(t)]
+    pairs = [(i, k) for i in range(n) for k in range(t) if mask[i, k]]
+    target = batch["target"]
+    if plan is None:
+        total = cfg.w_perc * torch.stack([perceptual(outs[k][i:i + 1], target[i:i + 1, k]) for i, k in pairs]).mean()
+    else:
+        total = cfg.w_perc * sum(w * perceptual(outs[k][i:i + 1], target[i:i + 1, k])
+                                 for k, picks in plan.items() for i, w in picks)
+    if batch["kind"][0] == "gt":
+        total = total + cfg.w_l1 * torch.stack([(outs[k][i] - target[i, k]).abs().mean() for i, k in pairs]).mean()
+    frames = mask.any(0).nonzero().flatten().tolist()
+    lock, _ = tr.lock_term(details, batch["x"], x_prev, flow, batch["reset"], frames, mask)
+    total = total + cfg.w_lock * lock
+    if pingpong:
+        twins = [(i, k, t - 1 - k) for i in range(n) for k in range(1, (t + 1) // 2 - 1) if mask[i, k] and mask[i, t - 1 - k]]
+        total = total + cfg.w_pp * torch.stack([(outs[k][i] - outs[r][i]).abs().mean() for i, k, r in twins]).mean()
+    total.backward()
+    return float(total), {name: p.grad.clone() for name, p in model.named_parameters()}
+
+
+@pytest.mark.parametrize("kind,pingpong", [("teacher", False), ("gt", False), ("teacher", True)])
+def test_items_of_a_batch_may_score_different_frames(perceptual, kind, pingpong):
+    batch = mixed_mask_batch(kind, pingpong)
+    model = tiny_model()
+    for p in model.head_tex.parameters():
+        p.data.mul_(100)
+    cfg = TrainConfig(data="-", out="-", device="cpu", grad_checkpoint=False)
+    want_loss, want = direct_per_item(model, perceptual, batch, cfg, pingpong)
+    model.zero_grad()
+    m = tr.compute_gradients(model, perceptual, batch, cfg, pingpong=pingpong, rng=np.random.default_rng(0))
+    assert m["loss"] == pytest.approx(want_loss, rel=1e-4)
+    for name, p in model.named_parameters():
+        assert torch.allclose(p.grad, want[name], rtol=1e-3, atol=1e-6), name
+    assert (m["pp"] is not None) == pingpong and (m["l1"] is not None) == (kind == "gt")
+
+
+@pytest.mark.parametrize("kind", ["teacher", "gt"])
+def test_an_unscored_frame_of_one_item_does_not_see_its_target(perceptual, kind):
+    cfg = TrainConfig(data="-", out="-", device="cpu")
+    model = tiny_model()
+    a = mixed_mask_batch(kind)
+    copy = lambda batch: {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+    hidden, seen = copy(a), copy(a)
+    hidden["target"][1, 3] = 1.0 - hidden["target"][1, 3]  # item 1 does not score frame 3
+    seen["target"][0, 3] = 1.0 - seen["target"][0, 3]  # item 0 does
+    runs = {}
+    for name, batch in (("a", a), ("hidden", hidden), ("seen", seen)):
+        model.zero_grad()
+        runs[name] = (tr.compute_gradients(model, perceptual, batch, cfg, rng=np.random.default_rng(0)),
+                      [p.grad.clone() for p in model.parameters()])
+    assert runs["hidden"][0]["loss"] == pytest.approx(runs["a"][0]["loss"])
+    assert all(torch.allclose(g, h) for g, h in zip(runs["a"][1], runs["hidden"][1]))
+    assert runs["seen"][0]["perc"] != pytest.approx(runs["a"][0]["perc"])
+
+
+def ragged_mask():
+    """(3, 20) loss masks of three items: a plain one, one missing 4 frames after a cut (R34), one missing 2."""
+    mask = torch.zeros(3, 20, dtype=torch.bool)
+    mask[:, 8:] = True
+    mask[1, 11:15] = False
+    mask[2, 18:] = False
+    return mask
+
+
+def plan_weights(plan, shape):
+    w = np.zeros(shape)
+    for t, picks in plan.items():
+        for i, weight in picks:
+            assert w[i, t] == 0  # each (item, frame) pair at most once
+            w[i, t] = weight
+    return w
+
+
+def test_perceptual_frames_are_drawn_per_item_from_its_own_loss_frames():
+    mask = ragged_mask()
+    rng = np.random.default_rng(0)
+    differ = 0
+    for _ in range(200):
+        w = plan_weights(tr.perceptual_plan(mask, 4, rng), mask.shape)
+        for i in range(3):
+            own = mask[i].numpy()
+            picked = np.flatnonzero(w[i])
+            assert set(picked) <= set(np.flatnonzero(own))  # only the item's own loss frames
+            assert len(picked) == round(4 * own.sum() / 12)  # 4 per 12 of its own: 4, 3 (8 frames), 3 (10 frames)
+        assert w.sum() == pytest.approx(1.0)  # the weights add up to one
+        differ += not np.array_equal(w[0] > 0, w[2] > 0)
+    assert differ > 150  # the items draw independently
+
+
+def test_the_per_item_perceptual_subset_is_unbiased():
+    """Over many draws every scored (item, frame) pair has the expected weight 1 / (scored pairs): the weighted sum is
+    an unbiased estimate of the mean over all scored pairs, though the items score different numbers of frames."""
+    mask = ragged_mask()
+    total = int(mask.sum())
+    rng = np.random.default_rng(1)
+    draws = 3000
+    mean_w = sum(plan_weights(tr.perceptual_plan(mask, 4, rng), mask.shape) for _ in range(draws)) / draws
+    assert np.all(mean_w[~mask.numpy()] == 0)
+    assert np.allclose(mean_w[mask.numpy()], 1 / total, rtol=0.12)
+    full = plan_weights(tr.perceptual_plan(mask, 12, rng), mask.shape)  # the default: every pair, the plain mean
+    assert np.allclose(full[mask.numpy()], 1 / total) and np.all(full[~mask.numpy()] == 0)
+
+
+def test_compute_gradients_applies_the_per_item_plan(perceptual):
+    """With a perceptual subset, compute_gradients' loss and gradients equal the per-item reference that uses the
+    same draw."""
+    batch = mixed_mask_batch("teacher")
+    model = tiny_model()
+    for p in model.head_tex.parameters():
+        p.data.mul_(100)
+    cfg = TrainConfig(data="-", out="-", device="cpu", grad_checkpoint=False, perc_frames=6)
+    plan = tr.perceptual_plan(batch["loss_mask"].bool(), cfg.perc_frames, np.random.default_rng(5))
+    assert any(len(picks) < 2 for picks in plan.values())  # some frame is scored for one item only
+    want_loss, want = direct_per_item(model, perceptual, batch, cfg, False, plan=plan)
+    model.zero_grad()
+    m = tr.compute_gradients(model, perceptual, batch, cfg, rng=np.random.default_rng(5))
+    assert m["loss"] == pytest.approx(want_loss, rel=1e-4)
+    for name, p in model.named_parameters():
+        assert torch.allclose(p.grad, want[name], rtol=1e-3, atol=1e-6), name
+
+
+@pytest.mark.parametrize("pingpong", [False, True])
+def test_a_training_step_on_items_with_different_loss_masks(perceptual, pingpong):
+    batch = mixed_mask_batch("teacher", pingpong)
+    model = tiny_model()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = TrainConfig(data="-", out="-", device="cpu", perc_frames=4)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    m = tr.train_step(model, perceptual, opt, batch, cfg, pingpong=pingpong, rng=np.random.default_rng(0))
+    assert math.isfinite(m["loss"]) and m["perc"] is not None and (m["pp"] is not None) == pingpong
+    assert any(not torch.equal(before[k], v) for k, v in model.state_dict().items())
+
+
+def test_lock_term_skips_the_unscored_frames_of_each_item():
+    b, details = lock_inputs()
+    b["reset"][:] = False
+    for t, d in enumerate(details):
+        d[0] += 5.0 * t  # item 0's detail jumps every frame: a lock over it would be large
+    x_prev, flow = tr.prepare_inputs(b["x"], b["flow"], b["reset"])
+    frames = [1, 2, 3]
+    scored = torch.ones(2, 4, dtype=torch.bool)
+    scored[0, :] = False  # item 0 scores nothing: the term is the term on item 1 alone
+    half, coverage = tr.lock_term(details, b["x"], x_prev, flow, b["reset"], frames, scored)
+    alone = [d[1:] for d in details]
+    ref = texture_lock(torch.cat([alone[t] for t in frames]), torch.cat([alone[t - 1] for t in frames]),
+                       torch.zeros(3, 2, 3 * H, 3 * W), torch.ones(3, 1, 3 * H, 3 * W, dtype=torch.bool))
+    assert float(half) == pytest.approx(float(ref), rel=1e-5) and float(coverage) == pytest.approx(0.5)
+    full, _ = tr.lock_term(details, b["x"], x_prev, flow, b["reset"], frames)
+    assert float(full) != pytest.approx(float(half), rel=1e-3)
+
+
+def test_trains_on_teacher_sequences_with_cuts(tmp_path):
+    """End to end: teacher items with and without a cut in one batch (R34 masks differ per item)."""
+    recs = [record(0, "teacher", cuts=[11]), record(1, "teacher"), record(2, "teacher", cuts=[15]), record(100, "gt")]
+    (tmp_path / "data").mkdir()
+    make_data(tmp_path / "data", recs)
+    cfg = cfg_for(tmp_path, iters=4, batch=2, pp_prob=0.5, ckpt_every=10)
+    assert tr.train(cfg).name == "ckpt_000004.pt"
+    assert all("skipped" not in row for row in read_log(cfg))
 
 
 # ---------------------------------------------------------------- perceptual subset
@@ -758,6 +998,49 @@ def test_a_finished_run_is_not_overwritten_without_resume(tmp_path):
     tr.train(cfg)
     with pytest.raises(FileExistsError, match="--resume"):
         tr.train(cfg)
+
+
+def batch_starts_on_look(monkeypatch, n):
+    """The run's batch check with pgrep injected: the batch is running from the n-th look on; -> the looks."""
+    looked = []
+
+    def pgrep(pattern):
+        looked.append(pattern)
+        return len(looked) >= n
+
+    monkeypatch.setattr(tr, "BatchGuard", lambda force: BatchGuard(force, pgrep=pgrep))
+    return looked
+
+
+def test_the_batch_is_looked_for_every_50_iterations(tmp_path, monkeypatch):
+    assert tr.BATCH_CHECK_EVERY == 50
+    fake_data(tmp_path)
+    monkeypatch.setattr(tr, "BATCH_CHECK_EVERY", 2)
+    looked = batch_starts_on_look(monkeypatch, 99)
+    tr.train(cfg_for(tmp_path, iters=5))
+    assert looked == ["scripts/batch-upscale.sh"] * 2  # after iterations 2 and 4
+
+
+def test_a_batch_started_mid_run_saves_latest_and_main_exits_3(tmp_path, monkeypatch, capsys):
+    fake_data(tmp_path)
+    monkeypatch.setattr(tr, "BATCH_CHECK_EVERY", 2)
+    looked = batch_starts_on_look(monkeypatch, 2)
+    cfg = cfg_for(tmp_path, iters=10, ckpt_every=100)
+    with pytest.raises(BatchStarted):
+        tr.train(cfg)
+    assert len(looked) == 2
+    assert torch.load(Path(cfg.out) / "latest.pt", map_location="cpu", weights_only=True)["iter"] == 4
+    monkeypatch.setattr(tr, "refuse_if_batch_running", lambda force: None)
+    looked = batch_starts_on_look(monkeypatch, 2)
+    argv = ["--data", cfg.data, "--out", str(tmp_path / "run2"), "--iters", "10", "--device", "cpu", "--num-workers",
+            "0", "--channels", "8", "--blocks", "1", "--hidden", "4", "--batch", "2", "--crop", "16", "8"]
+    assert tr.main(argv) == 3
+    out = capsys.readouterr().out
+    assert "batch" in out and "--resume" in out
+    assert torch.load(tmp_path / "run2" / "latest.pt", map_location="cpu", weights_only=True)["iter"] == 4
+    looked = batch_starts_on_look(monkeypatch, 1)  # running all along, but --force: never looked at
+    assert tr.main(argv[:3] + [str(tmp_path / "run3")] + argv[4:] + ["--iters", "4", "--force"]) == 0
+    assert looked == []
 
 
 def test_main_refuses_while_the_batch_runs(tmp_path, monkeypatch):

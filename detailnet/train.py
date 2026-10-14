@@ -1,13 +1,16 @@
 """Train DetailNet: imitate FlashVSR teacher frames and real 1080p frames, keep the texture locked over time.
 
     python -m detailnet.train --data output/detail-data --out output/detail-runs/r1 [--iters N] [--resume] [--force]
+    python -m detailnet.train --data output/detail-data --out output/detail-runs/r2 --iters 30000
+                              --init-from output/detail-runs/r1/latest.pt      (a tuning round: r1's weights, new run)
 
 What a step does. A batch is `batch` sequences of T frames from `detailnet.data.SequenceDataset` (T = 20: 8 burn-in
 frames plus 12 loss frames; 39 for a ping-pong batch: the 20 forward, then 18..0 replayed backwards). DetailNet runs
 over every frame in order with gradients (truncated BPTT over the whole sequence). Where a sequence has `reset` set, the
 network starts cold there: prev_detail and hidden are zero, the flow is zero and x_prev = x_t, per batch element, with
 masks rather than branches (`prepare_inputs`, `run_sequence`). The output is compose(base, detail, 1.0). Only frames
-with `loss_mask` are scored:
+with `loss_mask` are scored, per item: the items of a batch may score different frames (a teacher item does not score
+the first frames from a cut, R34), and every term is a mean over the (item, frame) pairs scored:
 
     perceptual (DISTS + LPIPS)  vs the target, teacher and gt batches         w_perc
     L1                          vs the target, gt batches only                w_l1
@@ -24,7 +27,8 @@ pushes those gradients (and the cheap terms' graph) through DetailNet. The resul
 everything. `grad_checkpoint` (on by default) additionally recomputes each DetailNet frame in the backward instead of
 keeping its activations: at batch 4 and T = 39 it takes the peak MPS memory from 23.9 GB (18.7 GB of live tensors) to
 8.5 GB (2.4 GB live) for about 10 % more time. `perc_frames` scores only a random subset of the loss frames
-perceptually (an unbiased estimate of the full mean; default: all of them).
+perceptually, drawn per item from that item's own loss frames and weighted so the sum is an unbiased estimate of the
+mean over all scored (item, frame) pairs (`perceptual_plan`; default: all of them).
 
 Epochs. An epoch is one pass over the larger of the teacher and gt datasets, in whole batches (the last batch wraps
 into the next pass). Every epoch rebuilds all datasets and loaders with seed = cfg.seed + 1_000_003 * epoch (new
@@ -39,8 +43,14 @@ restored optimizer state carries a stale lr) is exactly on the curve. A step who
 skipped and logged (no weight is touched, it does not count as an iteration); 10 skipped steps in a row end the run.
 
 Outputs in `--out`: train.jsonl (one JSON line per `log_every` steps, and one per skipped step), ckpt_000100.pt, ... every `ckpt_every` steps and at
-the end, latest.pt = {"model", "opt", "iter", "cfg"}. `--resume` continues from latest.pt. Guards: refuses to start
-while the user's batch runs (`--force` overrides); stops with exit 3 and a fresh latest.pt when swap grew by more than 8 GB.
+the end, latest.pt = {"model", "opt", "iter", "cfg"}. `--resume` continues from latest.pt (an error when there is none,
+so a mistyped --out never starts from scratch). `--init-from CKPT` starts a new run from CKPT's weights with a fresh
+optimizer at iteration 0, so the cosine schedule spans the new --iters (the tuning rounds: --init-from r1/latest.pt
+--iters 30000 --out r2); it cannot be combined with --resume, and a resumed run of it uses --resume alone.
+
+Guards: refuses to start while the user's batch runs (`--force` overrides), and looks again every 50 iterations: once the
+batch runs it stops with exit 3 and a fresh latest.pt (rerun with --resume); stops the same way when swap grew by more
+than 8 GB.
 """
 import argparse
 import json
@@ -62,8 +72,9 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torch.utils.data import DataLoader, Dataset
 
 from detailnet.data import KINDS, LOSS, SequenceDataset
-from detailnet.guards import SWAP_EXIT_CODE, SwapGuard, SwapLimitExceeded, refuse_if_batch_running
-from detailnet.losses import Perceptual, ping_pong, texture_lock
+from detailnet.guards import (BATCH_EXIT_CODE, SWAP_EXIT_CODE, BatchGuard, BatchStarted, SwapGuard, SwapLimitExceeded,
+                              refuse_if_batch_running)
+from detailnet.losses import Perceptual, texture_lock
 from detailnet.model import DetailNet, compose, occlusion_mask, tracking_maps, upsample_flow
 
 SCALE = 3  # source px -> output px
@@ -71,6 +82,7 @@ EPOCH_SEED_STRIDE = 1_000_003  # seed step per epoch; larger than any dataset, s
 PASS_SEED_STRIDE = 10_007  # seed step per repeat of a short dataset inside an epoch (also larger than the datasets)
 ARCHITECTURE = ("channels", "blocks", "hidden")
 MAX_CONSECUTIVE_SKIPS = 10  # non-finite steps in a row after which the run is aborted
+BATCH_CHECK_EVERY = 50  # iterations between looks for the user's batch
 
 
 class NoDataError(RuntimeError):
@@ -97,7 +109,7 @@ class TrainConfig:
     crop: tuple = (160, 90)  # (w, h) in source px of the training crops
     reset_prob: float = 0.15  # chance per item of one extra random reset at a loss frame
     pp_prob: float = 0.2  # chance per batch of being a ping-pong batch (T = 39)
-    perc_frames: int = 12  # perceptual frames per 12 loss frames each step; 12 or more scores all of them
+    perc_frames: int = 12  # perceptual frames per 12 loss frames of an item, each step; 12 or more: all of them
     grad_checkpoint: bool = True  # recompute each DetailNet frame in the backward instead of keeping its activations
     grad_clip: float = 1.0  # max gradient norm; 0 disables clipping
     device: str = "mps"
@@ -105,6 +117,7 @@ class TrainConfig:
     log_every: int = 10
     swap_limit_gb: float = 8.0
     resume: bool = False
+    init_from: str = ""  # checkpoint whose weights start a new run (fresh optimizer, iteration 0); "" for none
 
 
 # ---------------------------------------------------------------- device memory
@@ -166,12 +179,12 @@ def run_sequence(model, x, base, flow, reset, checkpoint=False):
 
 # ---------------------------------------------------------------- loss terms
 
-def lock_term(details, x, x_prev, flow, reset, frames):
+def lock_term(details, x, x_prev, flow, reset, frames, scored=None):
     """(texture lock, mask coverage) over the scored `frames` (those with a predecessor): the mean over every trusted
     output-resolution pixel of the frames and the batch of |d_t - warp(d_t-1, back)|. The mask is `occlusion_mask` at
     source resolution (made from the inputs the network actually saw: `x_prev` and `flow` from `prepare_inputs`)
-    upsampled nearest x3, and is empty at the reset frames of an element. `coverage` is the share of source pixels
-    trusted."""
+    upsampled nearest x3, and is empty at the reset frames of an element and, given `scored` (N, T) bool, at the frames
+    an element does not score. `coverage` is the share of source pixels trusted."""
     frames = [t for t in frames if t >= 1]
     if not frames:
         return details[0].sum() * 0.0, torch.zeros((), device=details[0].device)
@@ -181,6 +194,8 @@ def lock_term(details, x, x_prev, flow, reset, frames):
         xs, xp, fl = (a[:, frames].flatten(0, 1) for a in (x, x_prev, flow))
         trusted = occlusion_mask(tracking_maps(xs, xp, fl), fl)
         trusted &= ~reset[:, frames].flatten().view(-1, 1, 1, 1)
+        if scored is not None:
+            trusted &= scored[:, frames].flatten().view(-1, 1, 1, 1)
         mask_hr = F.interpolate(trusted.float(), scale_factor=SCALE, mode="nearest") > 0.5
         back_hr = upsample_flow(fl[:, 0:2], SCALE)
         coverage = trusted.float().mean()
@@ -197,6 +212,12 @@ def pingpong_pairs(loss_mask):
     return forward, [t - 1 - k for k in forward]
 
 
+def masked_mean(values, mask):
+    """Mean of `values` (N, F) over the entries where `mask` (N, F, bool) is True; 0 when none is."""
+    total = torch.where(mask, values, torch.zeros_like(values)).sum()
+    return total / mask.sum().clamp_min(1).to(values.dtype)
+
+
 def choose_perceptual_frames(frames, perc_frames, rng):
     """The loss `frames` that get the perceptual term this step: `perc_frames` per 12 frames (so 4 of a plain item's 12,
     8 of a ping-pong item's 23), uniformly at random; every frame when perc_frames >= 12. The mean over a uniform
@@ -206,6 +227,27 @@ def choose_perceptual_frames(frames, perc_frames, rng):
         return list(frames)
     k = min(n, max(1, round(perc_frames * n / LOSS)))
     return sorted(frames[i] for i in rng.choice(n, size=k, replace=False))
+
+
+def perceptual_plan(scored, perc_frames, rng):
+    """{frame: [(item, weight)]}, frames ascending: the (item, frame) pairs that get the perceptual term this step.
+    `scored` (N, T) bool is the batch's loss_mask. Each item draws its own subset of its own loss frames
+    (`choose_perceptual_frames`: perc_frames per 12, all of them at 12 or more). The weight n_i / (k_i * total), for an
+    item with n_i loss frames of which k_i were drawn and `total` scored pairs in the batch, makes the weighted sum an
+    unbiased estimate of the mean over all scored pairs, and exactly that mean when every frame is drawn. The weights
+    add up to 1."""
+    scored = torch.as_tensor(scored).bool().cpu()
+    total = int(scored.sum())
+    plan = defaultdict(list)
+    for i in range(scored.shape[0]):
+        own = scored[i].nonzero().flatten().tolist()
+        if not own:
+            continue
+        picked = choose_perceptual_frames(own, perc_frames, rng)
+        weight = len(own) / (len(picked) * total)
+        for t in picked:
+            plan[t].append((i, weight))
+    return dict(sorted(plan.items()))
 
 
 def batch_kind(batch):
@@ -220,14 +262,13 @@ def compute_gradients(model, perceptual, batch, cfg, pingpong=False, rng=None):
     """Forward and backward of one batch (tensors already on the model's device); leaves the gradient in the
     parameters (added to what is there) and returns floats: the weighted total `loss`, its terms `perc`, `l1`, `lock`
     and `pp`, and `mask` (the share of source pixels the lock trusts). A term that does not apply is None: perc when
-    w_perc is 0, l1 on a teacher batch, pp unless `pingpong` and some frame has a twin. The perceptual term is
-    backpropagated in two stages (see the module docstring)."""
+    w_perc is 0, l1 on a teacher batch, pp unless `pingpong` and some frame has a twin. Each term is the mean over the
+    (item, frame) pairs that `loss_mask` (N, T) scores, so the items may score different frames. The perceptual term
+    is backpropagated in two stages (see the module docstring)."""
     rng = rng if rng is not None else np.random.default_rng()
     x, base, flow, target, reset = (batch[k] for k in ("x", "base", "flow", "target", "reset"))
-    loss_mask = batch["loss_mask"]
-    if not bool((loss_mask == loss_mask[:1]).all()):
-        raise ValueError("the items of a batch have to share one loss_mask")
-    frames = loss_mask[0].nonzero().flatten().tolist()
+    scored = batch["loss_mask"].bool()  # (N, T): which frames each item scores
+    frames = scored.any(0).nonzero().flatten().tolist()  # the frames some item scores
     if not frames:
         raise ValueError("the batch has no loss frames")
     kind = batch_kind(batch)
@@ -239,16 +280,20 @@ def compute_gradients(model, perceptual, batch, cfg, pingpong=False, rng=None):
 
     # the cheap terms stay in this graph
     x_prev, flow_eff = prepare_inputs(x, flow, reset)
-    lock, coverage = lock_term(details, x, x_prev, flow_eff, reset, frames)
+    lock, coverage = lock_term(details, x, x_prev, flow_eff, reset, frames, scored)
     other = cfg.w_lock * lock
     l1 = pp = None
     if kind == "gt":
-        l1 = torch.stack([(outs[t] - target[:, t]).abs().mean() for t in frames]).mean()
+        per_item = torch.stack([(outs[t] - target[:, t]).abs().flatten(1).mean(1) for t in frames], dim=1)
+        l1 = masked_mean(per_item, scored[:, frames])
         other = other + cfg.w_l1 * l1
     if pingpong:
-        forward, reverse = pingpong_pairs(loss_mask[0])
-        if forward:
-            pp = ping_pong(torch.stack([outs[k] for k in forward]), torch.stack([outs[k] for k in reverse]))
+        forward, reverse = pingpong_pairs(scored.any(0))
+        both = scored[:, forward] & scored[:, reverse]  # the item scores the frame and its twin
+        if forward and bool(both.any()):
+            per_item = torch.stack([(outs[k] - outs[r]).abs().flatten(1).mean(1) for k, r in zip(forward, reverse)],
+                                   dim=1)  # ping_pong's mean |out_k - out_r|, per item
+            pp = masked_mean(per_item, both)
             other = other + cfg.w_pp * pp
 
     # stage 2: perceptual loss on a detached copy of each chosen output; its backward gives dL/d(output) and frees the
@@ -256,16 +301,21 @@ def compute_gradients(model, perceptual, batch, cfg, pingpong=False, rng=None):
     perc = None
     grads = {}
     if cfg.w_perc > 0:
-        chosen = choose_perceptual_frames(frames, cfg.perc_frames, rng)
         perc_sum = 0.0
-        for t in chosen:
+        for t, picks in perceptual_plan(scored, cfg.perc_frames, rng).items():
+            items = [i for i, _ in picks]
             leaf = outs[t].detach().requires_grad_(True)
-            value = perceptual(leaf, target[:, t])
-            (cfg.w_perc * value / len(chosen)).backward()
+            if len(items) == leaf.shape[0]:
+                pred, tgt = leaf, target[:, t]
+            else:
+                pred, tgt = leaf[items], target[items, t]  # the other items get no gradient from this frame
+            weight = torch.tensor([w for _, w in picks], dtype=leaf.dtype, device=leaf.device)
+            value = (perceptual.per_item(pred, tgt) * weight).sum()
+            (cfg.w_perc * value).backward()
             grads[t] = leaf.grad
             perc_sum = perc_sum + value.detach()
             MEMORY.sample()
-        perc = perc_sum / len(chosen)
+        perc = perc_sum
 
     # stage 3: one backward through the DetailNet graph with those gradients, plus the cheap terms
     roots = [other] + [outs[t] for t in grads]
@@ -448,11 +498,11 @@ def load_checkpoint(path):
     return model.eval(), state["cfg"]
 
 
-def _check_architecture(saved, cfg):
+def _check_architecture(saved, cfg, action="resume"):
     mismatch = [f"{k} is {saved.get(k, 32 if k == 'hidden' else None)} in the checkpoint but {getattr(cfg, k)} now"
                 for k in ARCHITECTURE if saved.get(k, 32 if k == "hidden" else None) != getattr(cfg, k)]
     if mismatch:
-        raise ValueError("cannot resume: " + "; ".join(mismatch))
+        raise ValueError(f"cannot {action}: " + "; ".join(mismatch))
 
 
 # ---------------------------------------------------------------- the loop
@@ -472,23 +522,42 @@ def _log_row(it, epoch, window, elapsed, opt):
             "mem_gb": _round(MEMORY.driver_gb), "live_gb": _round(MEMORY.live_gb)}
 
 
-def train(cfg):
+def train(cfg, force=False):
     """Train until `cfg.iters` steps are done (counting those of a resumed run); -> the last checkpoint's path.
-    Raises SwapLimitExceeded, KeyboardInterrupt, FloatingPointError (10 non-finite steps in a row), ... after saving
-    latest.pt (unless nothing was done yet)."""
+    Raises SwapLimitExceeded, BatchStarted (the user's batch runs, looked for every BATCH_CHECK_EVERY steps unless
+    `force`), KeyboardInterrupt, FloatingPointError (10 non-finite steps in a row), ... after saving latest.pt (unless
+    nothing was done yet). Refuses, before writing anything: --resume without latest.pt, a new run over an existing
+    latest.pt, and --init-from with --resume or with a checkpoint that is missing or of another architecture."""
     out = Path(cfg.out)
     latest = out / "latest.pt"
+    if cfg.resume and cfg.init_from:
+        raise ValueError("--init-from starts a new run from a checkpoint's weights and cannot be combined with --resume "
+                         "(which continues the run in --out)")
     if latest.exists() and not cfg.resume:
         raise FileExistsError(f"{latest} exists: pass --resume to continue that run, or choose another --out")
+    if cfg.resume and not latest.exists():
+        raise FileNotFoundError(f"{latest} does not exist, so there is nothing to --resume: check --out, or drop "
+                                "--resume to start a new run")
+    init = None
+    if cfg.init_from:
+        if not Path(cfg.init_from).is_file():
+            raise FileNotFoundError(f"--init-from {cfg.init_from}: no such checkpoint")
+        init = read_checkpoint(cfg.init_from)
+        _check_architecture(init["cfg"], cfg, f"initialise from {cfg.init_from}")
     out.mkdir(parents=True, exist_ok=True)
     device = torch.device(cfg.device)
     torch.manual_seed(cfg.seed)
     model = build_model(cfg).to(device)
+    if init is not None:
+        model.load_state_dict(init["model"])
+        print(f"starting from the weights of {cfg.init_from} (its iteration {init.get('iter')}): fresh optimizer, "
+              f"iteration 0 of {cfg.iters}", flush=True)
+        del init
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     it = 0
     resumed = False
-    if cfg.resume and latest.exists():
+    if cfg.resume:
         state = read_checkpoint(latest)
         _check_architecture(state["cfg"], cfg)
         model.load_state_dict(state["model"])
@@ -496,8 +565,6 @@ def train(cfg):
         it = int(state["iter"])
         resumed = True
         print(f"resuming from {latest} at iteration {it}", flush=True)
-    elif cfg.resume:
-        print(f"no {latest}: starting from scratch", flush=True)
 
     # epoch numbers continue where the run stopped, so a resumed run does not replay the first epochs' crops
     epoch = 0
@@ -509,6 +576,7 @@ def train(cfg):
 
     perceptual = Perceptual().to(device)
     guard = SwapGuard(cfg.swap_limit_gb)
+    batch_guard = BatchGuard(force)
     rng = np.random.default_rng([cfg.seed, 7, it])  # which frames get the perceptual term
     MEMORY.start(device)
     window = defaultdict(list)
@@ -555,6 +623,8 @@ def train(cfg):
                     save_run_checkpoint(out, model, opt, it, cfg)
                     saved_at = it
                 guard.check()
+                if it % BATCH_CHECK_EVERY == 0 and it < cfg.iters:  # a finished run just ends
+                    batch_guard.check()
             del iterators
             epoch += 1
     except BaseException:
@@ -576,9 +646,10 @@ HELP = {
     "data": "the build_data output directory (output/detail-data)",
     "out": "run directory for checkpoints and train.jsonl",
     "iters": "total optimizer steps (a resumed run counts the steps it already did)",
-    "resume": "continue from latest.pt in --out",
+    "resume": "continue from latest.pt in --out (an error when there is none)",
+    "init_from": "start a new run from this checkpoint's weights: fresh optimizer, iteration 0 (not with --resume)",
     "crop": "training crop in source px",
-    "perc_frames": "perceptual frames per 12 loss frames (12 or more: all)",
+    "perc_frames": "perceptual frames per 12 loss frames of each item, drawn per item (12 or more: all)",
     "grad_checkpoint": "recompute each DetailNet frame in the backward to save memory",
     "grad_clip": "max gradient norm (0: no clipping)",
     "num_workers": "data loader workers per loader",
@@ -605,16 +676,23 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.resume and args.init_from:
+        parser.error("--init-from starts a new run from a checkpoint's weights; it cannot be combined with --resume")
     refuse_if_batch_running(args.force)
     cfg = TrainConfig(**{f.name: getattr(args, f.name) for f in fields(TrainConfig)})
     cfg.crop = tuple(cfg.crop)
     try:
-        last = train(cfg)
+        last = train(cfg, force=args.force)
     except SwapLimitExceeded as err:
         print(f"stopping: {err}. latest.pt is saved; rerun with --resume", flush=True)
         return SWAP_EXIT_CODE
-    except (NoDataError, FileExistsError, FloatingPointError) as err:
+    except BatchStarted as err:
+        print(f"stopping: {err}. latest.pt is saved; rerun with --resume once the batch is done (or pass --force)",
+              flush=True)
+        return BATCH_EXIT_CODE
+    except (NoDataError, FileExistsError, FileNotFoundError, FloatingPointError) as err:
         print(f"error: {err}", flush=True)
         return 1
     print(f"done: {last}", flush=True)
