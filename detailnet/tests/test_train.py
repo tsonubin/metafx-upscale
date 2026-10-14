@@ -1,4 +1,6 @@
 import json
+import math
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -470,6 +472,69 @@ def test_a_short_dataset_is_reiterated_within_the_epoch(tmp_path):
     assert len(crops) > 2  # the repeats are other crops of the sequence, not the same item again
 
 
+def served(loaders, kind):
+    """Sequence ids (in serving order) that the epoch's loaders of `kind` deliver, plain and ping-pong together."""
+    ids = []
+    for (k, _), loader in sorted(loaders.items()):
+        if k == kind:
+            for batch in loader:
+                ids += batch["seq_id"].tolist()
+    return ids
+
+
+def test_an_epoch_serves_every_sequence_of_the_larger_kind(tmp_path):
+    fake_data(tmp_path, teacher=5, gt=7)  # 7 is not a multiple of the batch: 4 batches, the last one wraps
+    cfg = cfg_for(tmp_path, batch=2, pp_prob=0.5)
+    both = 0
+    for epoch in range(6):
+        e = tr.build_epoch(cfg, epoch, 1000)
+        gt = served(e.loaders, "gt")
+        assert len(gt) == 8 and set(gt) == set(range(100, 107)), (epoch, gt)  # every sequence at least once
+        both += ("gt", False) in e.loaders and ("gt", True) in e.loaders
+    assert both >= 3  # the plain and the ping-pong loaders were both in play in these epochs
+
+
+def test_the_tail_of_the_sequence_list_is_not_starved_in_either_loader(tmp_path):
+    """The sequence list is sorted and a dataset index is a sequence: a loader that reads the first `count` indices
+    serves the head of the list every epoch (here the plain loader would serve the last six sequences about 40% as
+    often as the first six, the ping-pong loader never)."""
+    fake_data(tmp_path, teacher=2, gt=20)
+    cfg = cfg_for(tmp_path, batch=2, pp_prob=0.2)
+    plain, pingpong = Counter(), Counter()
+    for epoch in range(25):
+        e = tr.build_epoch(cfg, epoch, 1000)
+        for (kind, pp), loader in e.loaders.items():
+            if kind == "gt":
+                (pingpong if pp else plain).update(i for batch in loader for i in batch["seq_id"].tolist())
+    head, tail = range(100, 106), range(114, 120)
+    mean = lambda counts, ids: np.mean([counts[i] for i in ids])
+    mean_plain = np.mean(list(plain.values()))
+    assert all(plain[i] > 0.6 * mean_plain for i in range(100, 120))  # flat: about 20 serves each over the 25 epochs
+    assert mean(plain, tail) > 0.75 * mean(plain, head)
+    assert mean(pingpong, tail) > 0.5 * mean(pingpong, head) and mean(pingpong, tail) > 2
+
+
+def test_a_short_kind_is_repeated_evenly_and_the_extra_serves_rotate(tmp_path):
+    fake_data(tmp_path, teacher=5, gt=7)
+    cfg = cfg_for(tmp_path, batch=2, pp_prob=0.0)
+    twice = set()
+    for epoch in range(10):
+        counts = Counter(served(tr.build_epoch(cfg, epoch, 1000).loaders, "teacher"))
+        assert sum(counts.values()) == 8 and set(counts) == set(range(5))  # 8 items over 5 sequences: 1 or 2 each
+        assert set(counts.values()) == {1, 2}
+        twice |= {i for i, n in counts.items() if n == 2}
+    assert twice == set(range(5))  # not always the same head of the list
+
+
+def test_the_serving_order_changes_between_epochs_but_not_between_builds(tmp_path):
+    fake_data(tmp_path, teacher=2, gt=12)
+    cfg = cfg_for(tmp_path, batch=2, pp_prob=0.0)
+    first = served(tr.build_epoch(cfg, 0, 1000).loaders, "gt")
+    assert first == served(tr.build_epoch(cfg, 0, 1000).loaders, "gt")
+    assert first != served(tr.build_epoch(cfg, 1, 1000).loaders, "gt")
+    assert sorted(first) == list(range(100, 112))
+
+
 def test_trains_with_a_dataset_shorter_than_the_batch(tmp_path):
     fake_data(tmp_path, teacher=1, gt=1)
     cfg = cfg_for(tmp_path, iters=3, batch=2, ckpt_every=10)
@@ -481,9 +546,143 @@ def test_trains_on_the_other_kind_when_one_has_no_sequences(tmp_path):
     cfg = cfg_for(tmp_path, iters=2, batch=2)
     tr.train(cfg)
     assert all(row["l1"] is not None for row in read_log(cfg))  # gt steps only
+
+
+def test_no_finished_sequence_at_all_is_an_error_and_leaves_no_checkpoint(tmp_path):
+    fake_data(tmp_path, teacher=0, gt=0)
+    cfg = cfg_for(tmp_path)
     with pytest.raises(tr.NoDataError):
-        fake_data(tmp_path / "empty", teacher=0, gt=0)
-        tr.train(cfg_for(tmp_path / "empty"))
+        tr.train(cfg)
+    assert not (Path(cfg.out) / "latest.pt").exists()  # nothing was done, so there is nothing to resume from
+    assert tr.main(["--data", cfg.data, "--out", str(tmp_path / "again"), "--device", "cpu"]) == 1
+
+
+# ---------------------------------------------------------------- learning rate
+
+def want_lr(base, it, iters):
+    return 0.5 * base * (1 + math.cos(math.pi * it / iters))
+
+
+def test_cosine_lr_shape():
+    cfg = TrainConfig(data="-", out="-", lr=2e-4, iters=100)
+    assert tr.cosine_lr(cfg, 0) == pytest.approx(2e-4)
+    assert tr.cosine_lr(cfg, 50) == pytest.approx(1e-4)
+    assert tr.cosine_lr(cfg, 100) == pytest.approx(0.0, abs=1e-12)
+    assert tr.cosine_lr(cfg, 250) == pytest.approx(0.0, abs=1e-12)  # past the horizon it stays at 0
+    lrs = [tr.cosine_lr(cfg, i) for i in range(101)]
+    assert all(a >= b for a, b in zip(lrs, lrs[1:]))
+
+
+def test_lr_follows_the_cosine_and_is_back_on_it_after_a_resume(tmp_path, monkeypatch):
+    fake_data(tmp_path)
+    base, iters = 1e-3, 6
+    cfg = cfg_for(tmp_path, iters=iters, lr=base, ckpt_every=100)
+
+    class StopAfterThree:
+        calls = 0
+
+        def __init__(self, limit_gb):
+            pass
+
+        def check(self):
+            StopAfterThree.calls += 1
+            if StopAfterThree.calls == 3:
+                raise SwapLimitExceeded("stop")
+
+    monkeypatch.setattr(tr, "SwapGuard", StopAfterThree)
+    with pytest.raises(SwapLimitExceeded):
+        tr.train(cfg)
+    stale = torch.load(Path(cfg.out) / "latest.pt", map_location="cpu", weights_only=True)
+    assert stale["iter"] == 3
+    assert stale["opt"]["param_groups"][0]["lr"] == pytest.approx(want_lr(base, 2, iters))  # the lr of the last step
+    monkeypatch.setattr(tr, "SwapGuard", QuietGuard)
+    tr.train(cfg_for(tmp_path, iters=iters, lr=base, ckpt_every=100, resume=True))
+    rows = read_log(cfg)
+    assert [r["iter"] for r in rows] == [1, 2, 3, 4, 5, 6]
+    for row in rows:  # the step that ends at iteration i started at i - 1
+        assert row["lr"] == pytest.approx(want_lr(base, row["iter"] - 1, iters), rel=1e-5), row["iter"]
+    assert rows[0]["lr"] == pytest.approx(base) and rows[-1]["lr"] == pytest.approx(want_lr(base, 5, iters), rel=1e-5)
+    assert rows[3]["lr"] != pytest.approx(stale["opt"]["param_groups"][0]["lr"], rel=1e-3)  # not the restored one
+    final = torch.load(Path(cfg.out) / "latest.pt", map_location="cpu", weights_only=True)
+    assert final["opt"]["param_groups"][0]["lr"] == pytest.approx(want_lr(base, 5, iters))
+
+
+def test_train_step_uses_the_optimizers_current_lr(perceptual):
+    model = tiny_model()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = TrainConfig(data="-", out="-", device="cpu")
+    tr.set_lr(opt, 0.0)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    tr.train_step(model, perceptual, opt, synthetic_batch(), cfg, rng=np.random.default_rng(0))
+    assert all(torch.equal(before[k], v) for k, v in model.state_dict().items())  # lr 0: Adam moves nothing
+
+
+# ---------------------------------------------------------------- non-finite steps are skipped
+
+def with_flaky_steps(monkeypatch, bad, nan=False):
+    """Make the `bad` calls (1-based) of `train_step` fail: with a real NaN target (nan=True) or by raising the
+    FloatingPointError directly. Returns the list of calls made."""
+    real = tr.train_step
+    calls = []
+
+    def step(model, perceptual, opt, batch, *args, **kwargs):
+        calls.append(1)
+        if len(calls) in bad:
+            if not nan:
+                raise FloatingPointError("injected")
+            batch = {**batch, "target": torch.full_like(batch["target"], float("nan"))}
+        return real(model, perceptual, opt, batch, *args, **kwargs)
+
+    monkeypatch.setattr(tr, "train_step", step)
+    return calls
+
+
+def test_a_non_finite_batch_is_skipped_logged_and_does_not_count(tmp_path, monkeypatch):
+    fake_data(tmp_path)
+    calls = with_flaky_steps(monkeypatch, {2, 3}, nan=True)
+    cfg = cfg_for(tmp_path, iters=4, ckpt_every=100)
+    assert tr.train(cfg).name == "ckpt_000004.pt"
+    assert len(calls) == 6  # two skipped batches on top of the four steps
+    rows = read_log(cfg)
+    skips = [r for r in rows if "skipped" in r]
+    assert [(r["iter"], r["skipped"]) for r in skips] == [(1, 1), (1, 2)] and "non-finite" in skips[0]["error"]
+    assert [r["iter"] for r in rows if "skipped" not in r] == [1, 2, 3, 4]
+    latest = torch.load(Path(cfg.out) / "latest.pt", map_location="cpu", weights_only=True)
+    assert latest["iter"] == 4 and latest["opt"]["state"][0]["step"] == 4  # four optimizer steps, none from the NaN
+    assert all(torch.isfinite(v).all() for v in latest["model"].values())
+
+
+def test_ten_non_finite_batches_in_a_row_end_the_run_after_saving_latest(tmp_path, monkeypatch):
+    fake_data(tmp_path)
+    calls = with_flaky_steps(monkeypatch, set(range(3, 100)))  # two good steps, then nothing but failures
+    cfg = cfg_for(tmp_path, iters=20, ckpt_every=100)
+    with pytest.raises(FloatingPointError, match="10 non-finite"):
+        tr.train(cfg)
+    assert len(calls) == 12
+    assert len([r for r in read_log(cfg) if "skipped" in r]) == 10
+    assert torch.load(Path(cfg.out) / "latest.pt", map_location="cpu", weights_only=True)["iter"] == 2
+    assert tr.MAX_CONSECUTIVE_SKIPS == 10
+
+
+def test_the_skip_count_is_of_consecutive_batches(tmp_path, monkeypatch):
+    fake_data(tmp_path)
+    bad = set(range(1, 10)) | set(range(11, 20))  # nine failures, one good step, nine failures, then good steps
+    calls = with_flaky_steps(monkeypatch, bad)
+    cfg = cfg_for(tmp_path, iters=3, ckpt_every=100)
+    tr.train(cfg)
+    assert len(calls) == 21
+
+
+def test_a_run_that_fails_before_its_first_step_leaves_no_latest(tmp_path, monkeypatch):
+    fake_data(tmp_path)
+    bad = set(range(1, 100))
+    with_flaky_steps(monkeypatch, bad)
+    cfg = cfg_for(tmp_path, iters=1)
+    with pytest.raises(FloatingPointError, match="10 non-finite"):
+        tr.train(cfg)
+    assert not (Path(cfg.out) / "latest.pt").exists()
+    bad.clear()
+    assert tr.train(cfg).name == "ckpt_000001.pt"  # a rerun with the same --out is not refused as an existing run
 
 
 # ---------------------------------------------------------------- logs and guards
@@ -553,7 +752,7 @@ def test_main_calls_the_batch_guard_with_force(tmp_path, monkeypatch):
     assert seen == [False, True]
 
 
-def test_a_finished_run_is_not_overwritten_without_resume(tmp_path, capsys):
+def test_a_finished_run_is_not_overwritten_without_resume(tmp_path):
     fake_data(tmp_path)
     cfg = cfg_for(tmp_path, iters=1)
     tr.train(cfg)
@@ -568,7 +767,6 @@ def test_main_refuses_while_the_batch_runs(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="refusing"):
         tr.main(["--data", "x", "--out", str(tmp_path / "run"), "--device", "cpu"])
     assert not (tmp_path / "run").exists()
-    assert tr.main  # with --force the same guard lets the run start (it then fails on the missing data, not the guard)
 
 
 def test_config_defaults_are_the_briefs():

@@ -26,11 +26,19 @@ keeping its activations: at batch 4 and T = 39 it takes the peak MPS memory from
 8.5 GB (2.4 GB live) for about 10 % more time. `perc_frames` scores only a random subset of the loss frames
 perceptually (an unbiased estimate of the full mean; default: all of them).
 
-Epochs. An epoch is one pass over the larger of the teacher and gt datasets, in batches. Every epoch rebuilds all
-datasets and loaders with seed = cfg.seed + 1_000_003 * epoch (new crops, and sequences finished meanwhile by the
-FlashVSR job). The smaller dataset is repeated within the epoch, each repeat with another crop seed.
+Epochs. An epoch is one pass over the larger of the teacher and gt datasets, in whole batches (the last batch wraps
+into the next pass). Every epoch rebuilds all datasets and loaders with seed = cfg.seed + 1_000_003 * epoch (new
+crops, and sequences finished meanwhile by the FlashVSR job). Each kind is served from a stream of seeded permutations
+of all its sequences, re-drawn on every pass, so no sequence is starved: the plain and the ping-pong loaders of a kind
+take consecutive slices of that stream, which together cover the dataset, and the smaller dataset is simply repeated
+within the epoch, each repeat with another permutation and another crop seed.
 
-Outputs in `--out`: train.jsonl (one JSON line per `log_every` steps), ckpt_000100.pt, ... every `ckpt_every` steps and at
+Optimizer. AdamW (lr 2e-4, weight decay 1e-4) with cosine decay to 0 over `--iters`: before each step the lr is set to
+0.5 * lr * (1 + cos(pi * it / iters)) from the step counter, not from a scheduler object, so a resumed run (whose
+restored optimizer state carries a stale lr) is exactly on the curve. A step whose loss or gradient is not finite is
+skipped and logged (no weight is touched, it does not count as an iteration); 10 skipped steps in a row end the run.
+
+Outputs in `--out`: train.jsonl (one JSON line per `log_every` steps, and one per skipped step), ckpt_000100.pt, ... every `ckpt_every` steps and at
 the end, latest.pt = {"model", "opt", "iter", "cfg"}. `--resume` continues from latest.pt. Guards: refuses to start
 while the user's batch runs (`--force` overrides); stops with exit 3 and a fresh latest.pt when swap grew by more than 8 GB.
 """
@@ -62,6 +70,7 @@ SCALE = 3  # source px -> output px
 EPOCH_SEED_STRIDE = 1_000_003  # seed step per epoch; larger than any dataset, so epochs never share (seed + index)
 PASS_SEED_STRIDE = 10_007  # seed step per repeat of a short dataset inside an epoch (also larger than the datasets)
 ARCHITECTURE = ("channels", "blocks", "hidden")
+MAX_CONSECUTIVE_SKIPS = 10  # non-finite steps in a row after which the run is aborted
 
 
 class NoDataError(RuntimeError):
@@ -209,9 +218,10 @@ def batch_kind(batch):
 
 def compute_gradients(model, perceptual, batch, cfg, pingpong=False, rng=None):
     """Forward and backward of one batch (tensors already on the model's device); leaves the gradient in the
-    parameters (added to what is there) and returns the loss terms as floats: loss (weighted total), perc, l1, lock,
-    pp (None where the term does not apply or has weight 0 for perc) and mask (share of source pixels the lock trusts).
-    The perceptual term is backpropagated in two stages (see the module docstring)."""
+    parameters (added to what is there) and returns floats: the weighted total `loss`, its terms `perc`, `l1`, `lock`
+    and `pp`, and `mask` (the share of source pixels the lock trusts). A term that does not apply is None: perc when
+    w_perc is 0, l1 on a teacher batch, pp unless `pingpong` and some frame has a twin. The perceptual term is
+    backpropagated in two stages (see the module docstring)."""
     rng = rng if rng is not None else np.random.default_rng()
     x, base, flow, target, reset = (batch[k] for k in ("x", "base", "flow", "target", "reset"))
     loss_mask = batch["loss_mask"]
@@ -270,9 +280,19 @@ def compute_gradients(model, perceptual, batch, cfg, pingpong=False, rng=None):
     return values
 
 
+def cosine_lr(cfg, it):
+    """Learning rate of the step that starts at iteration `it`: cfg.lr, cosine-decayed to 0 over cfg.iters steps."""
+    return 0.5 * cfg.lr * (1.0 + math.cos(math.pi * min(it, cfg.iters) / max(cfg.iters, 1)))
+
+
+def set_lr(opt, lr):
+    for group in opt.param_groups:
+        group["lr"] = lr
+
+
 def train_step(model, perceptual, opt, batch, cfg, pingpong=False, rng=None):
-    """One optimizer step on `batch`; -> the metrics of `compute_gradients` plus grad_norm. A non-finite loss or
-    gradient raises FloatingPointError before any weight is touched."""
+    """One optimizer step on `batch` at the optimizer's current lr; -> the metrics of `compute_gradients` plus
+    grad_norm. A non-finite loss or gradient raises FloatingPointError before any weight is touched."""
     opt.zero_grad(set_to_none=True)
     metrics = compute_gradients(model, perceptual, batch, cfg, pingpong, rng)
     if not math.isfinite(metrics["loss"]):
@@ -295,21 +315,33 @@ def epoch_schedule(kinds, steps, pp_prob, rng):
 
 
 class Passes(Dataset):
-    """`count` items drawn from `dataset` in passes over it; every pass shifts the dataset's seed, so a dataset
-    shorter than the epoch needs gives other crops of its sequences instead of the same items again."""
+    """`count` items of one kind, taken from position `offset` of a stream of passes over `dataset`. Every pass is a
+    permutation of all the dataset's sequences drawn from (`stream_key`, pass number), so each sequence is served once
+    per pass, in an order that differs between passes and between epochs, and the tail of a sorted sequence list is not
+    starved. The plain and the ping-pong loaders of a kind take consecutive slices (different `offset`) of one stream.
+    Every pass also shifts the dataset's seed, so a dataset shorter than the epoch needs gives other crops of its
+    sequences instead of the same items again."""
 
-    def __init__(self, dataset, count):
-        self.dataset, self.count, self.base_seed = dataset, int(count), dataset.seed
+    def __init__(self, dataset, count, stream_key, offset=0):
+        self.dataset, self.count, self.offset = dataset, int(count), int(offset)
+        self.stream_key, self.base_seed = tuple(stream_key), dataset.seed
+        self._permutation = None  # (pass number, order) of the pass served last
 
     def __len__(self):
         return self.count
 
+    def _order(self, number):
+        if self._permutation is None or self._permutation[0] != number:
+            rng = np.random.default_rng([*self.stream_key, number])
+            self._permutation = (number, rng.permutation(len(self.dataset)))
+        return self._permutation[1]
+
     def __getitem__(self, index):
         if not 0 <= index < self.count:
             raise IndexError(index)
-        repeat, item = divmod(int(index), len(self.dataset))
-        self.dataset.seed = self.base_seed + PASS_SEED_STRIDE * repeat
-        return self.dataset[item]
+        number, slot = divmod(self.offset + int(index), len(self.dataset))
+        self.dataset.seed = self.base_seed + PASS_SEED_STRIDE * number
+        return self.dataset[int(self._order(number)[slot])]
 
 
 class Epoch(NamedTuple):
@@ -328,7 +360,8 @@ def _sequence_dataset(cfg, kind, ping_pong, seed):
 
 
 def _steps_per_kind(sizes, batch):
-    return max(1, max(sizes.values()) // batch)
+    """Batches of one kind per epoch: one pass over the larger dataset, rounded up to whole batches."""
+    return max(1, -(-max(sizes.values()) // batch))
 
 
 def build_epoch(cfg, epoch, max_steps):
@@ -343,14 +376,15 @@ def build_epoch(cfg, epoch, max_steps):
     rng = np.random.default_rng([cfg.seed, epoch])
     schedule = epoch_schedule(kinds, _steps_per_kind({k: sizes[k] for k in kinds}, cfg.batch), cfg.pp_prob,
                               rng)[:max_steps]
+    counts = Counter(schedule)
     loaders = {}
-    for (kind, pp), steps in sorted(Counter(schedule).items()):
+    for (kind, pp), steps in sorted(counts.items()):
         dataset = _sequence_dataset(cfg, kind, True, seed) if pp else plain[kind]
+        offset = counts[(kind, False)] * cfg.batch if pp else 0  # the ping-pong slice follows the plain one
         extra = {"prefetch_factor": 1} if cfg.num_workers > 0 else {}
         loaders[(kind, pp)] = DataLoader(
-            Passes(dataset, steps * cfg.batch), batch_size=cfg.batch, shuffle=True, drop_last=True,
-            num_workers=cfg.num_workers, persistent_workers=False,
-            generator=torch.Generator().manual_seed(seed + KINDS.index(kind) * 2 + pp + 1), **extra)
+            Passes(dataset, steps * cfg.batch, (seed, KINDS.index(kind)), offset), batch_size=cfg.batch,
+            shuffle=False, drop_last=True, num_workers=cfg.num_workers, persistent_workers=False, **extra)
     return Epoch(schedule, loaders, sizes)
 
 
@@ -427,19 +461,21 @@ def _round(v):
     return None if v is None else float(f"{v:.6g}")
 
 
-def _log_row(it, epoch, window, elapsed, cfg):
+def _log_row(it, epoch, window, elapsed, opt):
     mean = lambda name: float(np.mean(window[name])) if window[name] else None
     return {"iter": it, "epoch": epoch, "loss": _round(mean("loss")), "perc": _round(mean("perc")),
             "l1": _round(mean("l1")), "lock": _round(mean("lock")), "pp": _round(mean("pp")),
             "mask": _round(mean("mask")), "grad_norm": _round(mean("grad_norm")),
-            "gt_steps": len(window["l1"]), "pp_steps": len(window["pp"]), "lr": cfg.lr,
+            "gt_steps": len(window["l1"]), "pp_steps": len(window["pp"]),
+            "lr": _round(opt.param_groups[0]["lr"]),
             "it_per_s": _round(len(window["loss"]) / max(elapsed, 1e-9)),
             "mem_gb": _round(MEMORY.driver_gb), "live_gb": _round(MEMORY.live_gb)}
 
 
 def train(cfg):
     """Train until `cfg.iters` steps are done (counting those of a resumed run); -> the last checkpoint's path.
-    Raises SwapLimitExceeded, KeyboardInterrupt, ... after saving latest.pt."""
+    Raises SwapLimitExceeded, KeyboardInterrupt, FloatingPointError (10 non-finite steps in a row), ... after saving
+    latest.pt (unless nothing was done yet)."""
     out = Path(cfg.out)
     latest = out / "latest.pt"
     if latest.exists() and not cfg.resume:
@@ -451,12 +487,14 @@ def train(cfg):
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     it = 0
+    resumed = False
     if cfg.resume and latest.exists():
         state = read_checkpoint(latest)
         _check_architecture(state["cfg"], cfg)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
         it = int(state["iter"])
+        resumed = True
         print(f"resuming from {latest} at iteration {it}", flush=True)
     elif cfg.resume:
         print(f"no {latest}: starting from scratch", flush=True)
@@ -476,6 +514,7 @@ def train(cfg):
     window = defaultdict(list)
     window_start = time.perf_counter()
     saved_at = None
+    skipped = 0  # non-finite steps in a row
     log_path = out / "train.jsonl"
 
     try:
@@ -488,14 +527,25 @@ def train(cfg):
                 if key not in iterators:
                     iterators[key] = iter(current.loaders[key])
                 batch = to_device(next(iterators[key]), device)
-                metrics = train_step(model, perceptual, opt, batch, cfg, pingpong=key[1], rng=rng)
+                set_lr(opt, cosine_lr(cfg, it))
+                try:
+                    metrics = train_step(model, perceptual, opt, batch, cfg, pingpong=key[1], rng=rng)
+                except FloatingPointError as err:
+                    skipped += 1
+                    row = {"iter": it, "epoch": epoch, "skipped": skipped, "error": str(err)[:300]}
+                    with open(log_path, "a") as f:
+                        f.write(json.dumps(row) + "\n")
+                    print(json.dumps(row), flush=True)
+                    if skipped >= MAX_CONSECUTIVE_SKIPS:
+                        raise FloatingPointError(f"{skipped} non-finite steps in a row, the last: {err}") from err
+                    continue
+                skipped = 0
                 it += 1
                 for name, value in metrics.items():
                     if value is not None:
                         window[name].append(value)
-                guard.check()
                 if it % cfg.log_every == 0 or it == cfg.iters:
-                    row = _log_row(it, epoch, window, time.perf_counter() - window_start, cfg)
+                    row = _log_row(it, epoch, window, time.perf_counter() - window_start, opt)
                     with open(log_path, "a") as f:
                         f.write(json.dumps(row) + "\n")
                     print(json.dumps(row), flush=True)
@@ -504,13 +554,15 @@ def train(cfg):
                 if it % cfg.ckpt_every == 0 or it == cfg.iters:
                     save_run_checkpoint(out, model, opt, it, cfg)
                     saved_at = it
+                guard.check()
             del iterators
             epoch += 1
     except BaseException:
-        try:
-            save_run_checkpoint(out, model, opt, it, cfg, numbered=False)
-        except Exception as err:  # keep the original failure
-            print(f"could not save {latest}: {err}", file=sys.stderr, flush=True)
+        if it or resumed:  # a run that fails before its first step has nothing worth resuming from
+            try:
+                save_run_checkpoint(out, model, opt, it, cfg, numbered=False)
+            except Exception as err:  # keep the original failure
+                print(f"could not save {latest}: {err}", file=sys.stderr, flush=True)
         raise
 
     if saved_at != it or not (out / f"ckpt_{it:06d}.pt").exists():
@@ -562,7 +614,7 @@ def main(argv=None):
     except SwapLimitExceeded as err:
         print(f"stopping: {err}. latest.pt is saved; rerun with --resume", flush=True)
         return SWAP_EXIT_CODE
-    except (NoDataError, FileExistsError) as err:
+    except (NoDataError, FileExistsError, FloatingPointError) as err:
         print(f"error: {err}", flush=True)
         return 1
     print(f"done: {last}", flush=True)
