@@ -1,0 +1,7 @@
+[
+ {"name": "g3-lizard-grass", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 28782, "frames": 100, "kind": "gt3", "why": "GT x3 (640x360 input), static frill-neck lizard in grass"},
+ {"name": "g3-waterfall", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 45088, "frames": 100, "kind": "gt3", "why": "GT x3 (640x360 input), slow pan, rock walls and waterfall"},
+ {"name": "g3-wallaby-fast", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 17273, "frames": 100, "kind": "gt3", "why": "GT x3 (640x360 input), fast pan, wallaby splashing"},
+ {"name": "g3-frog-rain", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 35396, "frames": 100, "kind": "gt3", "why": "GT x3 (640x360 input), frog in falling rain (local motion)"},
+ {"name": "g3-cut-gorge", "source": "~/Downloads/Series 1 Ep 1 [DO2303H001S00].mp4", "start": 53417, "frames": 100, "kind": "gt3", "why": "GT x3 (640x360 input), hard cut into the river gorge shot"}
+]

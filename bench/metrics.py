@@ -17,6 +17,11 @@ that straddle a scene cut are skipped.
                change). Reported per motion bucket of the pair (static <0.3, slow <2,
                fast ≥2 px/frame at 720p scale).
   flicker      the same numerator without the normalisation (luma levels, 0–255).
+  jitter_phase mean jitter of pair t (the pair (t-1, t), inside one shot) grouped by t mod 4: a list of 4
+               floats, null where no pair falls in that phase.
+  pulse        max ÷ mean of the non-null jitter_phase entries: ~1 for steady output, above 1 when the
+               jitter breathes with a period of 4 frames (a recurrent texture generator that re-seeds or
+               rebuilds its detail every few frames); null without pairs.
   detail       mean gradient magnitude of the output ÷ that of the bicubic upscale.
   cut_leak     mean |Y| difference between cut-aware and cut-ignoring runs over the 25
                frames after each cut (needs <model>-nocut.mkv).
@@ -41,6 +46,7 @@ BUCKETS = [("static", 0.0, 0.3), ("slow", 0.3, 2.0), ("fast", 2.0, 1e9)]
 LEAK_FRAMES = 25
 REAL_SCORE_FRAMES = 100  # real clips are scored on their first 4 s, the span every model ran on
 CROP = (1920, 1080)  # 4K outputs are scored on their central 1920x1080 at 1:1 pixels
+PULSE_PERIOD = 4  # frames; the period jitter_phase / pulse look for
 
 
 def eval_geometry(tw, th, size=CROP):
@@ -112,6 +118,23 @@ def bucket_of(speed):
     return next(name for name, lo, hi in BUCKETS if lo <= speed < hi)
 
 
+def jitter_phase(pairs, period=PULSE_PERIOD):
+    """Mean jitter per phase: `pairs` is an iterable of (t, jitter) for the pairs (t-1, t) that were scored; the result
+    is a list of `period` means over t % period, None where no pair has that phase."""
+    sums = [[] for _ in range(period)]
+    for t, value in pairs:
+        sums[t % period].append(value)
+    return [float(np.mean(v)) if v else None for v in sums]
+
+
+def pulse_of(phase):
+    """max / mean of the non-null entries of a jitter_phase list; None without entries or with a zero mean."""
+    present = [v for v in phase if v is not None]
+    if not present or np.mean(present) <= 0:
+        return None
+    return float(max(present) / np.mean(present))
+
+
 class LPIPSScorer:
     def __init__(self):
         import lpips
@@ -170,6 +193,7 @@ def evaluate(clip_dir, model, max_frames=None, region=None):
 
     per_bucket = {name: [] for name, _, _ in BUCKETS}
     jitter = {name: [] for name, _, _ in BUCKETS}
+    pair_jitter = []  # (t, normalised jitter) of every scored pair, for the period-4 profile
     detail, psnr, lp, ds, tlp = [], [], [], [], []
     prev = prev_bic = prev_gt = None
     for t in range(n):
@@ -196,7 +220,9 @@ def evaluate(clip_dir, model, max_frames=None, region=None):
                 d_bic = bic - warp(prev_bic, mx, my)
                 num = float(np.abs(d_model - d_bic)[mask].mean())
                 per_bucket[bucket_of(speed)].append(num)
-                jitter[bucket_of(speed)].append(num / max(float(grad_map(y)[mask].mean()), 1e-6))
+                jit = num / max(float(grad_map(y)[mask].mean()), 1e-6)
+                jitter[bucket_of(speed)].append(jit)
+                pair_jitter.append((t, jit))
             if has_gt:
                 tlp.append(abs(scorer.lpips(out, prev_out_img) - scorer.lpips(gt, prev_gt)) * 100)
         prev, prev_bic, prev_out_img, prev_gt = y, bic, out, gt
@@ -210,6 +236,10 @@ def evaluate(clip_dir, model, max_frames=None, region=None):
     res["jitter"] = {k: (round(float(np.mean(v)), 3) if v else None) for k, v in jitter.items()}
     all_j = [x for v in jitter.values() for x in v]
     res["jitter_all"] = round(float(np.mean(all_j)), 3) if all_j else None
+    phase = jitter_phase(pair_jitter)
+    pulse = pulse_of(phase)
+    res["jitter_phase"] = [round(v, 4) if v is not None else None for v in phase]
+    res["pulse"] = round(pulse, 3) if pulse is not None else None
     if has_gt:
         res.update(psnr_y=round(float(np.mean(psnr)), 2), lpips=round(float(np.mean(lp)), 4),
                    dists=round(float(np.mean(ds)), 4) if ds[0] is not None else None,
