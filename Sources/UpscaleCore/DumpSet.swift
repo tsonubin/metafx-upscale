@@ -48,9 +48,10 @@ final class DumpSet {
     /// The dumped window in source pixels.
     let crop: CropRect
 
-    /// Flow between two consecutive source frames: backward, forward, and the size of the flow grid.
-    private typealias FlowEstimate = (CVPixelBuffer, CVPixelBuffer, Bool) throws
-        -> (backward: [Float16], forward: [Float16], width: Int, height: Int)
+    /// Flow between two consecutive source frames (previous, current, sequential): backward and forward in source
+    /// pixels, the size of the flow grid, and whether the pair was tracked (see `OpticalFlowEstimator.flow`).
+    typealias FlowEstimate = (CVPixelBuffer, CVPixelBuffer, Bool) throws
+        -> (backward: [Float16], forward: [Float16], width: Int, height: Int, valid: Bool)
 
     private let sourceWriter: FrameDumpWriter?
     private let baseWriter: FrameDumpWriter?
@@ -64,7 +65,11 @@ final class DumpSet {
     private var flowPairs = 0
     private var finished = false
 
-    init(options: DumpOptions, sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int) throws {
+    /// `flowEstimate` replaces the VideoToolbox estimator for flow dumps (tests use it).
+    init(
+        options: DumpOptions, sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int,
+        flowEstimate: FlowEstimate? = nil
+    ) throws {
         let scale = try baseScale(
             sourceWidth: sourceWidth, sourceHeight: sourceHeight, outputWidth: outputWidth, outputHeight: outputHeight)
         let crop = options.crop ?? CropRect(x: 0, y: 0, width: sourceWidth, height: sourceHeight)
@@ -77,7 +82,9 @@ final class DumpSet {
         let baseCrop = CropRect(x: crop.x * scale, y: crop.y * scale, width: crop.width * scale, height: crop.height * scale)
 
         // Set up the estimator before any directory is created, so a source it can't handle leaves nothing behind.
-        if options.flow != nil {
+        if options.flow != nil, let flowEstimate {
+            estimateFlow = flowEstimate
+        } else if options.flow != nil {
             guard #available(macOS 26.0, *) else {
                 throw UpscaleError.scalerUnavailable("Optical flow dumps need macOS 26 or later.")
             }
@@ -131,18 +138,18 @@ final class DumpSet {
     }
 
     /// `[back_x, back_y, fwd_x, fwd_y]` on the crop's grid, in source pixels. The first frame has nothing before it:
-    /// zeros, marked invalid.
+    /// zeros, marked invalid. So is a pair the estimator could not track (non-finite flow, zeroed).
     private func flowFrame(into source: CVPixelBuffer) throws -> (planes: [Float16], valid: Bool) {
         let size = 4 * crop.width * crop.height
         guard let previousSource, let estimateFlow else { return ([Float16](repeating: 0, count: size), false) }
         let flow = try estimateFlow(previousSource, source, flowPairs > 0)
         flowPairs += 1
+        // Grid pixel j covers source pixels j·r..<(j+1)·r, with r the same on both axes.
+        let ratio = Float(sourceSize.width) / Float(flow.width)
         func onCrop(_ field: [Float16]) -> [Float16] {
-            FlowGrid.resample(
-                field, width: flow.width, height: flow.height, sourceWidth: sourceSize.width,
-                sourceHeight: sourceSize.height, crop: crop)
+            FlowGrid.resample(field, width: flow.width, height: flow.height, scale: ratio, crop: crop)
         }
-        return (onCrop(flow.backward) + onCrop(flow.forward), true)
+        return (onCrop(flow.backward) + onCrop(flow.forward), flow.valid)
     }
 
     /// Writes every `meta.json` for the frames recorded so far. Safe to call more than once.

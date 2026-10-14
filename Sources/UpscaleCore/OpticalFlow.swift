@@ -14,10 +14,11 @@ import VideoToolbox
 /// VideoToolbox names them the same way (`VTFrameProcessorOpticalFlow.forwardFlow` runs from `sourceFrame` to
 /// `nextFrame`); `OpticalFlowTests` checks this against a known shift.
 ///
-/// The flow is smaller than the frame (a quarter of its size at 720p: 320×180) and VideoToolbox reports it in
-/// pixels of that smaller grid, so the values are multiplied by the frame/flow size ratio. This only holds when
-/// the flow buffer covers the frame with the same ratio on both axes, which it does for the usual 16:9 and 4:3 sizes
-/// but not for every size (see `init`). Not thread-safe.
+/// The flow is smaller than the frame: a quarter of its size up to 720p (320×180 for 1280×720), an eighth at 1080p and
+/// 4K (240×135 for 1920×1080), and VideoToolbox reports it in pixels of that smaller grid. Values are multiplied by the
+/// frame/grid size ratio, the same on both axes. That only holds when the grid covers the whole frame at that ratio,
+/// which the initialiser checks: for sizes that don't get such a grid (854×480, 1280×544, 256×144, …) it throws
+/// rather than hand back flow that is wrong or only valid on part of the frame. Not thread-safe.
 @available(macOS 26.0, *)
 final class OpticalFlowEstimator {
     let frameWidth: Int
@@ -31,17 +32,19 @@ final class OpticalFlowEstimator {
     private let inputFormat: OSType
     private let forwardBuffer: CVPixelBuffer
     private let backwardBuffer: CVPixelBuffer
-    private let scaleX: Float
-    private let scaleY: Float
+    /// Source pixels per flow-grid pixel, for both axes.
+    private let scale: Float
     private var converter: FrameConverter?
     /// Counts submissions so each frame gets its own, increasing, presentation time.
     private var submissions: Int64 = 0
 
-    /// Throws when VideoToolbox can't do optical flow at this size, or when it would hand back a flow grid whose
-    /// values can't be turned into source pixels. VideoToolbox picks the grid from a few preset sizes, and for frames
-    /// that don't fit one it pads the grid and scales the values by (frame width / grid width) on both axes, so the
-    /// per-axis ratio used here would be wrong on y. 256×144 is one such size (an 80×60 grid).
-    init(width: Int, height: Int) throws {
+    /// Throws when VideoToolbox can't do optical flow at this size, or when its flow grid doesn't cover the frame at
+    /// a whole-number scale of 4 or 8 (the grid may be one pixel off the rounded-up frame/4 or frame/8). VideoToolbox
+    /// picks the grid from a few preset sizes; when the frame doesn't fit one it pads the grid, and the flow covers
+    /// only the top-left part of it, with values still in units of (frame width / grid width). 256×144 (an 80×60
+    /// grid), 854×480 (240×135) and 1280×544 (320×180) are such sizes. 320×180, 640×360, 960×540, 1280×720,
+    /// 1920×1080 and 3840×2160 are covered.
+        init(width: Int, height: Int) throws {
         guard VTOpticalFlowConfiguration.isSupported else {
             throw UpscaleError.scalerUnavailable("VideoToolbox optical flow isn't supported on this Mac (needs macOS 26+).")
         }
@@ -68,12 +71,15 @@ final class OpticalFlowEstimator {
             throw UpscaleError.unsupportedInput(
                 "VideoToolbox optical flow produces \(PixelBuffers.fourCC(flowFormat)) buffers, which aren't supported.")
         }
-        let (ratioX, ratioY) = (Double(width) / Double(flowWidth), Double(height) / Double(flowHeight))
-        guard abs(ratioX - ratioY) <= 0.02 * ratioX else {
+        func ceilDiv(_ value: Int, _ divisor: Int) -> Int { (value + divisor - 1) / divisor }
+        let covered = [4, 8].contains { divisor in
+            abs(flowWidth - ceilDiv(width, divisor)) <= 1 && abs(flowHeight - ceilDiv(height, divisor)) <= 1
+        }
+        guard covered else {
             throw UpscaleError.unsupportedInput(
                 "VideoToolbox returns a \(flowWidth)x\(flowHeight) optical flow grid for \(width)x\(height) frames, "
-                    + "which doesn't cover the frame at the same scale on both axes, so its values can't be turned into "
-                    + "source pixels. Use a source with a 16:9 or 4:3 frame size, e.g. 1280x720 or 1920x1080.")
+                    + "which isn't a quarter or an eighth of the frame, so the flow covers only part of the frame and "
+                    + "can't be turned into source pixels. Use a source such as 1280x720 or 1920x1080.")
         }
 
         var forward: CVPixelBuffer?
@@ -92,8 +98,7 @@ final class OpticalFlowEstimator {
         self.inputFormat = inputFormat
         forwardBuffer = forward
         backwardBuffer = backward
-        scaleX = Float(ratioX)
-        scaleY = Float(ratioY)
+        scale = Float(width) / Float(flowWidth)
     }
 
     deinit {
@@ -103,9 +108,12 @@ final class OpticalFlowEstimator {
     /// The flow between two consecutive frames. `sequential` says `previous` is the frame that came before `current`
     /// in the last call too (frames in presentation order, none skipped); pass false for the first pair and after any
     /// jump. Frames are converted to the format VideoToolbox wants when they aren't in it.
+    ///
+    /// `valid` is false when VideoToolbox returned a value that is not a finite half float (it does on flat frames,
+    /// where there is nothing to track). Those values are written as 0, and the pair should be treated as untracked.
     func flow(
         previous: CVPixelBuffer, current: CVPixelBuffer, sequential: Bool
-    ) throws -> (backward: [Float16], forward: [Float16], width: Int, height: Int) {
+    ) throws -> (backward: [Float16], forward: [Float16], width: Int, height: Int, valid: Bool) {
         for frame in [previous, current] {
             guard CVPixelBufferGetWidth(frame) == frameWidth, CVPixelBufferGetHeight(frame) == frameHeight else {
                 throw UpscaleError.io(
@@ -138,10 +146,11 @@ final class OpticalFlowEstimator {
             throw UpscaleError.scalerUnavailable("Optical flow failed: \(failure.localizedDescription)")
         }
 
+        let backward = try FlowGrid.planes(of: backwardBuffer, scale: scale)
+        let forward = try FlowGrid.planes(of: forwardBuffer, scale: scale)
         return (
-            backward: try FlowGrid.planes(of: backwardBuffer, scaleX: scaleX, scaleY: scaleY),
-            forward: try FlowGrid.planes(of: forwardBuffer, scaleX: scaleX, scaleY: scaleY),
-            width: flowWidth, height: flowHeight)
+            backward: backward.planes, forward: forward.planes, width: flowWidth, height: flowHeight,
+            valid: backward.finite && forward.finite)
     }
 
     /// `frame` as VideoToolbox wants it: itself when it already is, otherwise a converted copy.
@@ -198,10 +207,10 @@ enum FlowGrid {
     /// The two-channel buffer formats `planes` can read.
     static let supportedFormats: Set<OSType> = [kCVPixelFormatType_TwoComponent16Half, kCVPixelFormatType_TwoComponent32Float]
 
-    /// The planes of a two-component flow buffer, with x multiplied by `scaleX` and y by `scaleY`. Values that aren't
-    /// finite half floats come out as 0: on flat frames (all black, say) there is nothing to track and VideoToolbox
-    /// returns noise, sometimes huge or NaN, which must not reach a training set.
-    static func planes(of buffer: CVPixelBuffer, scaleX: Float, scaleY: Float) throws -> [Float16] {
+    /// The planes of a two-component flow buffer with both multiplied by `scale`. `finite` is false when a value was
+    /// not a finite half float (after scaling); such values come out as 0. On flat frames (all black, say) there is
+    /// nothing to track and VideoToolbox returns noise, sometimes huge or NaN, which must not reach a training set.
+    static func planes(of buffer: CVPixelBuffer, scale: Float) throws -> (planes: [Float16], finite: Bool) {
         let format = CVPixelBufferGetPixelFormatType(buffer)
         guard supportedFormats.contains(format) else {
             throw UpscaleError.unsupportedInput(
@@ -219,6 +228,7 @@ enum FlowGrid {
         let stride = CVPixelBufferGetBytesPerRow(buffer)
         let plane = width * height
         var planes = [Float16](repeating: 0, count: 2 * plane)
+        var finite = true
         planes.withUnsafeMutableBufferPointer { out in
             for y in 0..<height {
                 let row = base + y * stride
@@ -228,36 +238,37 @@ enum FlowGrid {
                     let (u, v): (Float, Float) =
                         format == kCVPixelFormatType_TwoComponent16Half
                         ? (Float(half[2 * x]), Float(half[2 * x + 1])) : (float[2 * x], float[2 * x + 1])
-                    out[y * width + x] = finiteHalf(u * scaleX)
-                    out[plane + y * width + x] = finiteHalf(v * scaleY)
+                    if let scaled = finiteHalf(u * scale) { out[y * width + x] = scaled } else { finite = false }
+                    if let scaled = finiteHalf(v * scale) { out[plane + y * width + x] = scaled } else { finite = false }
                 }
             }
         }
-        return planes
+        return (planes, finite)
     }
 
-    private static func finiteHalf(_ value: Float) -> Float16 {
-        abs(value) <= Float(Float16.greatestFiniteMagnitude) ? Float16(value) : 0 // false for NaN too
+    /// `value` as a half float, or nil when it is NaN, infinite or too large for one.
+    private static func finiteHalf(_ value: Float) -> Float16? {
+        abs(value) <= Float(Float16.greatestFiniteMagnitude) ? Float16(value) : nil // false for NaN too
     }
 
-    /// Samples a flow field that covers the whole `sourceWidth`×`sourceHeight` frame at the centres of the pixels of
-    /// `crop` (in source pixels), bilinearly with the edges clamped, giving a 2×crop.height×crop.width field. The
-    /// field's values are already in source pixels, so they are kept as they are. When the field is as large as the
-    /// source this is a plain crop.
+    /// Samples a flow field whose pixels are `scale` source pixels wide and tall (the same on both axes: grid pixel
+    /// j covers source pixels j·scale..<(j+1)·scale, from the frame's top-left corner) at the centres of the pixels of
+    /// `crop` (in source pixels), bilinearly with the edges clamped. This gives a 2×crop.height×crop.width field. The
+    /// field's values are already in source pixels, so they are kept as they are. With scale 1 this is a plain crop.
     static func resample(
-        _ field: [Float16], width: Int, height: Int, sourceWidth: Int, sourceHeight: Int, crop: CropRect
+        _ field: [Float16], width: Int, height: Int, scale: Float, crop: CropRect
     ) -> [Float16] {
         /// For each of `count` output pixels starting at `origin`: the two field indices to blend and the weight of the second.
-        func taps(origin: Int, count: Int, fieldSize: Int, sourceSize: Int) -> [(low: Int, high: Int, weight: Float)] {
+        func taps(origin: Int, count: Int, fieldSize: Int) -> [(low: Int, high: Int, weight: Float)] {
             (0..<count).map { index in
-                let position = (Float(origin + index) + 0.5) * Float(fieldSize) / Float(sourceSize) - 0.5
+                let position = (Float(origin + index) + 0.5) / scale - 0.5
                 let clamped = min(max(position, 0), Float(fieldSize - 1))
                 let low = min(Int(clamped), fieldSize - 1)
                 return (low, min(low + 1, fieldSize - 1), clamped - Float(low))
             }
         }
-        let columns = taps(origin: crop.x, count: crop.width, fieldSize: width, sourceSize: sourceWidth)
-        let rows = taps(origin: crop.y, count: crop.height, fieldSize: height, sourceSize: sourceHeight)
+        let columns = taps(origin: crop.x, count: crop.width, fieldSize: width)
+        let rows = taps(origin: crop.y, count: crop.height, fieldSize: height)
 
         let (fieldPlane, outPlane) = (width * height, crop.width * crop.height)
         var out = [Float16](repeating: 0, count: 2 * outPlane)

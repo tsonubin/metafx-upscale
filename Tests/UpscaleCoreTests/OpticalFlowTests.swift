@@ -36,22 +36,26 @@ enum NoiseFrames {
         let (fieldWidth, fieldHeight) = (width + 2 * pad, height + 2 * pad)
         var random = SplitMix64(state: 42)
         var field = (0..<fieldWidth * fieldHeight).map { _ in Float.random(in: 0...1, using: &random) }
-        for _ in 0..<3 { // three 3x3 box blurs
-            var blurred = field
+        for _ in 0..<3 { // three 3x3 box blurs, as a horizontal and a vertical 3-tap pass each
+            var across = field
             for y in 0..<fieldHeight {
                 for x in 0..<fieldWidth {
+                    let (from, to) = (max(0, x - 1), min(fieldWidth - 1, x + 1))
                     var sum: Float = 0
-                    var count: Float = 0
-                    for ny in max(0, y - 1)...min(fieldHeight - 1, y + 1) {
-                        for nx in max(0, x - 1)...min(fieldWidth - 1, x + 1) {
-                            sum += field[ny * fieldWidth + nx]
-                            count += 1
-                        }
-                    }
-                    blurred[y * fieldWidth + x] = sum / count
+                    for nx in from...to { sum += field[y * fieldWidth + nx] }
+                    across[y * fieldWidth + x] = sum / Float(to - from + 1)
                 }
             }
-            field = blurred
+            var down = across
+            for y in 0..<fieldHeight {
+                let (from, to) = (max(0, y - 1), min(fieldHeight - 1, y + 1))
+                for x in 0..<fieldWidth {
+                    var sum: Float = 0
+                    for ny in from...to { sum += across[ny * fieldWidth + x] }
+                    down[y * fieldWidth + x] = sum / Float(to - from + 1)
+                }
+            }
+            field = down
         }
         let (low, high) = (field.min() ?? 0, field.max() ?? 1)
         func level(_ x: Int, _ y: Int) -> Float { (field[y * fieldWidth + x] - low) / (high - low) }
@@ -99,14 +103,14 @@ func median(_ values: ArraySlice<Float16>) -> Float {
     return sorted.isEmpty ? .nan : sorted[sorted.count / 2]
 }
 
-/// A source size that VideoToolbox gives a flow buffer for with a whole-frame, same-scale-on-both-axes layout (80x45
-/// for this one, a quarter of the frame). The smallest 16:9 size at or above 256x144 that does: VideoToolbox accepts
-/// 256x144 too, but returns a padded 80x60 buffer there (see `rejectsPaddedFlowBuffers`).
+/// A source size whose flow grid covers the whole frame at a whole-number scale (80x45 for this one, a quarter of the
+/// frame). The smallest 16:9 size at or above 256x144 that does: VideoToolbox accepts 256x144 too, but returns a padded
+/// 80x60 grid there (see `rejectsSizesWhoseGridDoesNotCoverTheFrame`).
 let flowTestSize = (width: 320, height: 180)
 
 struct OpticalFlowTests {
     @available(macOS 26.0, *)
-    private func estimate(dx: Int, dy: Int) throws -> (backward: [Float16], forward: [Float16], width: Int, height: Int) {
+    private func estimate(dx: Int, dy: Int) throws -> (backward: [Float16], forward: [Float16], width: Int, height: Int, valid: Bool) {
         let estimator = try OpticalFlowEstimator(width: flowTestSize.width, height: flowTestSize.height)
         let frames = try NoiseFrames.pair(width: flowTestSize.width, height: flowTestSize.height, dx: dx, dy: dy)
         return try estimator.flow(previous: frames.previous, current: frames.current, sequential: false)
@@ -171,6 +175,53 @@ struct OpticalFlowTests {
         }
     }
 
+    /// The values of `plane` (a flat W×H plane) in the `blockWidth`×`blockHeight` block whose top-left is (x, y).
+    private func block(_ plane: ArraySlice<Float16>, width: Int, x: Int, y: Int, blockWidth: Int, blockHeight: Int) -> ArraySlice<Float16> {
+        let rows = (y..<y + blockHeight).map { row in plane.dropFirst(row * width + x).prefix(blockWidth) }
+        return ArraySlice(rows.flatMap { $0 })
+    }
+
+    @Test(.enabled(if: opticalFlowSupported))
+    func flowIsRightInAllFourCornersToo() throws {
+        guard #available(macOS 26.0, *) else { return }
+        // The whole field must carry the shift, not just its median: check blocks at each corner of the 80x45 grid.
+        let result = try estimate(dx: 8, dy: 6)
+        let (width, height) = (result.width, result.height)
+        let plane = width * height
+        for (name, field, expectedX, expectedY) in [("backward", result.backward, Float(-8), Float(-6)), ("forward", result.forward, 8, 6)] {
+            for (corner, x, y) in [("top-left", 0, 0), ("top-right", width - 10, 0), ("bottom-left", 0, height - 6), ("bottom-right", width - 10, height - 6)] {
+                let xs = block(field[0..<plane], width: width, x: x, y: y, blockWidth: 10, blockHeight: 6)
+                let ys = block(field[plane...], width: width, x: x, y: y, blockWidth: 10, blockHeight: 6)
+                #expect(abs(median(xs) - expectedX) < 1, "\(name) \(corner) x median was \(median(xs))")
+                #expect(abs(median(ys) - expectedY) < 1, "\(name) \(corner) y median was \(median(ys))")
+                let worst = max(xs.map { abs(Float($0) - expectedX) }.max() ?? 0, ys.map { abs(Float($0) - expectedY) }.max() ?? 0)
+                #expect(worst < 3, "\(name) \(corner): a value was \(worst) px from the shift")
+            }
+        }
+    }
+
+    @Test(.enabled(if: opticalFlowSupported))
+    func detectsShiftAtFullHD() throws {
+        guard #available(macOS 26.0, *) else { return }
+        // 1920x1080 gets a 240x135 grid, an eighth of the frame: a 16 px move is 2 grid pixels.
+        let estimator = try OpticalFlowEstimator(width: 1920, height: 1080)
+        #expect(estimator.flowWidth == 240 && estimator.flowHeight == 135)
+        let frames = try NoiseFrames.pair(width: 1920, height: 1080, dx: 16, dy: 8)
+        let result = try estimator.flow(previous: frames.previous, current: frames.current, sequential: false)
+        let (width, height) = (result.width, result.height)
+        let plane = width * height
+        #expect(result.valid)
+        for (name, field, expectedX, expectedY) in [("backward", result.backward, Float(-16), Float(-8)), ("forward", result.forward, 16, 8)] {
+            #expect(abs(median(field[0..<plane]) - expectedX) < 1.5, "\(name) x median was \(median(field[0..<plane]))")
+            #expect(abs(median(field[plane...]) - expectedY) < 1.5, "\(name) y median was \(median(field[plane...]))")
+            // The bottom-right corner of the frame.
+            let xs = block(field[0..<plane], width: width, x: width - 16, y: height - 9, blockWidth: 16, blockHeight: 9)
+            let ys = block(field[plane...], width: width, x: width - 16, y: height - 9, blockWidth: 16, blockHeight: 9)
+            #expect(abs(median(xs) - expectedX) < 1.5, "\(name) bottom-right x median was \(median(xs))")
+            #expect(abs(median(ys) - expectedY) < 1.5, "\(name) bottom-right y median was \(median(ys))")
+        }
+    }
+
     @Test(.enabled(if: opticalFlowSupported))
     func rejectsFramesOfTheWrongSize() throws {
         guard #available(macOS 26.0, *) else { return }
@@ -181,13 +232,28 @@ struct OpticalFlowTests {
         }
     }
 
-    @Test(.enabled(if: opticalFlowSupported))
-    func rejectsPaddedFlowBuffers() throws {
+    @Test(.enabled(if: opticalFlowSupported), arguments: [
+        (256, 144), (854, 480), (720, 480), (1280, 544), (1024, 576), (1366, 768), (2560, 1440),
+    ])
+    func rejectsSizesWhoseGridDoesNotCoverTheFrame(width: Int, height: Int) throws {
         guard #available(macOS 26.0, *) else { return }
-        // For 256x144 VideoToolbox returns an 80x60 flow buffer: the flow sits in its top-left 64x36 and the values
-        // are scaled by 256/80 on both axes (a 4 px move reads 1.25, not 1.667 on y), so a per-axis rescale from the
-        // buffer size would be wrong. Frame sizes like that are refused instead of dumping wrong flow.
-        #expect(throws: UpscaleError.self) { try OpticalFlowEstimator(width: 256, height: 144) }
+        // VideoToolbox pads the flow grid for these (256x144 gets 80x60, 854x480 and 720x480 get 240x135 and 180x135),
+        // and the flow covers only the top-left part of it. At 854x480 the right 11% and bottom 11% of the frame
+        // are garbage, and a per-axis rescale of 256x144 reads 3 px for a 4 px move on y. They are refused instead of
+        // dumping wrong flow.
+        #expect(throws: UpscaleError.self) { try OpticalFlowEstimator(width: width, height: height) }
+    }
+
+    @Test(.enabled(if: opticalFlowSupported), arguments: [
+        (320, 180), (640, 360), (960, 540), (1280, 720), (1920, 1080), (480, 270), (1440, 1080), (3840, 2160),
+    ])
+    func acceptsSizesWhoseGridCoversTheFrame(width: Int, height: Int) throws {
+        guard #available(macOS 26.0, *) else { return }
+        // The grid is a quarter of the frame (an eighth at 1080p and 4K), rounded up; 480x270 gets 120x67.
+        let estimator = try OpticalFlowEstimator(width: width, height: height)
+        let ratio = width / estimator.flowWidth
+        #expect(ratio == 4 || ratio == 8)
+        #expect(abs(estimator.flowHeight - (height + ratio - 1) / ratio) <= 1)
     }
 
     @Test(.enabled(if: opticalFlowSupported))
@@ -224,13 +290,14 @@ struct FlowGridTests {
     }
 
     @Test(arguments: [kCVPixelFormatType_TwoComponent16Half, kCVPixelFormatType_TwoComponent32Float])
-    func readsPlanesAndScalesPerAxis(format: OSType) throws {
+    func readsPlanesAndScalesBothAxes(format: OSType) throws {
         // Pixel (x, y): u = x, v = 10 + y.
         let buffer = try twoComponentBuffer(width: 4, height: 3, format: format) { x, y in (Float(x), Float(10 + y)) }
-        let planes = try FlowGrid.planes(of: buffer, scaleX: 4, scaleY: 2)
+        let (planes, finite) = try FlowGrid.planes(of: buffer, scale: 4)
         try #require(planes.count == 2 * 4 * 3)
+        #expect(finite)
         #expect(Array(planes[0..<12]) == (0..<3).flatMap { _ in (0..<4).map { Float16($0 * 4) } })
-        #expect(Array(planes[12..<24]) == (0..<3).flatMap { y in (0..<4).map { _ in Float16((10 + y) * 2) } })
+        #expect(Array(planes[12..<24]) == (0..<3).flatMap { y in (0..<4).map { _ in Float16((10 + y) * 4) } })
     }
 
     @Test func readerZeroesValuesThatAreNotFiniteHalfFloats() throws {
@@ -238,26 +305,40 @@ struct FlowGridTests {
         let buffer = try twoComponentBuffer(width: 6, height: 1, format: kCVPixelFormatType_TwoComponent32Float) { x, _ in
             (values[x], values[5 - x])
         }
-        let planes = try FlowGrid.planes(of: buffer, scaleX: 1, scaleY: 1)
+        let (planes, finite) = try FlowGrid.planes(of: buffer, scale: 1)
         #expect(planes == [0, 0, 0, 0, 0, 3, /* y */ 3, 0, 0, 0, 0, 0])
+        #expect(!finite) // the pair is reported as untracked
         // The scale can push a finite value out of range too.
-        #expect(try FlowGrid.planes(of: buffer, scaleX: 100, scaleY: 1)[5] == 300)
+        let scaled = try FlowGrid.planes(of: buffer, scale: 100)
+        #expect(scaled.planes[5] == 300 && !scaled.finite)
+        let calm = try twoComponentBuffer(width: 2, height: 1, format: kCVPixelFormatType_TwoComponent16Half) { x, _ in (Float(x), -2) }
+        #expect(try FlowGrid.planes(of: calm, scale: 1000).finite)
     }
 
     @Test func readerRejectsOtherFormats() throws {
         let bgra = try NoiseFrames.makeFrame(width: 4, height: 3, format: kCVPixelFormatType_32BGRA) { _, _ in 0 }
-        #expect(throws: UpscaleError.self) { try FlowGrid.planes(of: bgra, scaleX: 1, scaleY: 1) }
+        #expect(throws: UpscaleError.self) { try FlowGrid.planes(of: bgra, scale: 1) }
     }
 
-    @Test func resampleIsTheCropWhenTheGridMatchesTheSource() {
+    @Test func resampleIsTheCropWhenTheGridIsOneToOne() {
         // A 6x4 field with u = x + 10 * y, v = -x: cropping x 1..<4, y 1..<3 picks those pixels exactly.
         let (width, height) = (6, 4)
         let field: [Float16] =
             (0..<height).flatMap { y in (0..<width).map { x in Float16(x + 10 * y) } }
             + (0..<height).flatMap { _ in (0..<width).map { x in Float16(-x) } }
         let crop = CropRect(x: 1, y: 1, width: 3, height: 2)
-        let out = FlowGrid.resample(field, width: width, height: height, sourceWidth: 6, sourceHeight: 4, crop: crop)
+        let out = FlowGrid.resample(field, width: width, height: height, scale: 1, crop: crop)
         #expect(out == [11, 12, 13, 21, 22, 23, -1, -2, -3, -1, -2, -3])
+    }
+
+    @Test func resampleUsesTheSameScaleOnBothAxes() throws {
+        // A 2-wide, 3-tall grid at 4 source px per grid px: u = 0, v = the grid row. Source row 4 has its centre at grid
+        // row (4 + 0.5) / 4 - 0.5 = 0.625; row 11 is past the last grid row's centre (2) and clamps to it.
+        let field: [Float16] = [0, 0, 0, 0, 0, 0, /* v */ 0, 0, 1, 1, 2, 2]
+        let out = FlowGrid.resample(field, width: 2, height: 3, scale: 4, crop: CropRect(x: 0, y: 4, width: 1, height: 1))
+        #expect(out.map(Float.init) == [0, 0.625])
+        let last = FlowGrid.resample(field, width: 2, height: 3, scale: 4, crop: CropRect(x: 7, y: 11, width: 1, height: 1))
+        #expect(last.map(Float.init) == [0, 2])
     }
 
     @Test func resampleInterpolatesALowerResolutionGridAtSourcePixelCentres() throws {
@@ -265,7 +346,7 @@ struct FlowGridTests {
         // u = 10 * i, v = j. Source column 0 and 3 lie outside the outer grid centres (clamped); 1 and 2 are interpolated.
         let field: [Float16] = [0, 10, 0, 10, /* v */ 0, 0, 1, 1]
         let out = FlowGrid.resample(
-            field, width: 2, height: 2, sourceWidth: 4, sourceHeight: 4, crop: CropRect(x: 0, y: 0, width: 4, height: 1))
+            field, width: 2, height: 2, scale: 2, crop: CropRect(x: 0, y: 0, width: 4, height: 1))
         try #require(out.count == 8)
         // Grid x for source column c is (c + 0.5) / 2 - 0.5 = -0.25, 0.25, 0.75, 1.25 -> clamped 0, 0.25, 0.75, 1.
         #expect(out[0..<4].map(Float.init) == [0, 2.5, 7.5, 10])

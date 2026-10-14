@@ -231,6 +231,68 @@ struct DumpSetTests {
     }
 
     @Test(.enabled(if: opticalFlowSupported))
+    func flowInTheBottomRightCornerMatchesTheShift() throws {
+        // The crop is the last 64x36 pixels of the frame: all of it comes from the edge of the flow grid, and every
+        // value of it (not just the median) must be near the +8, +6 move.
+        let (width, height) = flowTestSize
+        let frames = try NoiseFrames.pair(width: width, height: height, dx: 8, dy: 6)
+        try withTempDirectory { root in
+            let flowDir = root.appendingPathComponent("f")
+            let crop = CropRect(x: width - 64, y: height - 36, width: 64, height: 36)
+            let dumps = try DumpSet(
+                options: DumpOptions(flow: flowDir, crop: crop),
+                sourceWidth: width, sourceHeight: height, outputWidth: 2 * width, outputHeight: 2 * height)
+            try dumps.record(source: frames.previous, upscaled: frames.previous, at: .zero)
+            try dumps.record(source: frames.current, upscaled: frames.current, at: CMTime(value: 1, timescale: 25))
+            try dumps.finish()
+
+            let flow = try readHalves(flowDir.appendingPathComponent("000001.f16"))
+            let plane = 64 * 36
+            for (index, expected) in [Float(-8), -6, 8, 6].enumerated() {
+                let channel = flow[index * plane..<(index + 1) * plane]
+                #expect(abs(median(channel) - expected) < 1, "channel \(index) median was \(median(channel))")
+                let worst = channel.map { abs(Float($0) - expected) }.max() ?? 0
+                #expect(worst < 3, "channel \(index) has a value \(worst) px from \(expected)")
+            }
+        }
+    }
+
+    @Test func pairsTheEstimatorCouldNotTrackAreMarkedInvalid() throws {
+        // A stand-in estimator: a 2x2 flow grid over the 8x8 source (4 source px per grid px) that reports pair 2 as untracked.
+        final class Calls {
+            var sequential: [Bool] = []
+        }
+        let calls = Calls()
+        let estimate: DumpSet.FlowEstimate = { _, _, sequential in
+            calls.sequential.append(sequential)
+            let untracked = calls.sequential.count == 2
+            // backward x = 1, y = 2; forward x = 3, y = 4 (grid pixels already in source pixels).
+            return (
+                backward: [1, 1, 1, 1, 2, 2, 2, 2], forward: [3, 3, 3, 3, 4, 4, 4, 4], width: 2, height: 2, valid: !untracked)
+        }
+        try withTempDirectory { root in
+            let flowDir = root.appendingPathComponent("f")
+            let dumps = try DumpSet(
+                options: DumpOptions(flow: flowDir, crop: CropRect(x: 2, y: 1, width: 3, height: 2)),
+                sourceWidth: 8, sourceHeight: 8, outputWidth: 16, outputHeight: 16, flowEstimate: estimate)
+            let frame = try makeBuffer(width: 8, height: 8) { _, _ in (0.5, 0.5, 0.5, 1) }
+            for index in 0..<4 {
+                try dumps.record(source: frame, upscaled: frame, at: CMTime(value: Int64(index), timescale: 25))
+            }
+            try dumps.finish()
+
+            #expect(calls.sequential == [false, true, true]) // the first pair starts the sequence
+            let meta = try readMeta(flowDir)
+            #expect(meta["frames"] as? Int == 4)
+            #expect(meta["valid"] as? [Bool] == [false, true, false, true])
+            // The flow values are kept as they are (already source pixels) and cover the crop: 4 x 3 x 2.
+            let flow = try readHalves(flowDir.appendingPathComponent("000001.f16"))
+            #expect(flow == [Float16](repeating: 1, count: 6) + [Float16](repeating: 2, count: 6)
+                + [Float16](repeating: 3, count: 6) + [Float16](repeating: 4, count: 6))
+        }
+    }
+
+    @Test(.enabled(if: opticalFlowSupported))
     func flowDumpIsRefusedForSizesWhoseFlowCannotBeTurnedIntoSourcePixels() throws {
         try withTempDirectory { root in
             let dirs = ["s", "f"].map { root.appendingPathComponent($0) }
