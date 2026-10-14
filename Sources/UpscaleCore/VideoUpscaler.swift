@@ -15,6 +15,8 @@ public enum VideoUpscaler {
         public var duration: Double?
         /// Polled once per frame; returning true stops the job with `CancellationError` and removes the partial file.
         public var isCancelled: (() -> Bool)?
+        /// Frame dumps for detail-layer training; they need the `ml` engine and an integer scale.
+        public var dumps: DumpOptions?
 
         public init() {}
     }
@@ -69,9 +71,15 @@ public enum VideoUpscaler {
         guard dstW >= srcW, dstH >= srcH, dstW * dstH > srcW * srcH else {
             throw UpscaleError.notAnUpscale(source: "\(srcW)x\(srcH)", target: "\(dstW)x\(dstH)")
         }
+        try validate(options, sourceWidth: srcW, sourceHeight: srcH, outputWidth: dstW, outputHeight: dstH)
         let colorProperties = try colorProperties(of: formats.first)
         let fps = frameRate > 0 ? Double(frameRate) : 30
         let bitrate = options.bitrate ?? defaultBitrate(width: dstW, height: dstH, fps: fps)
+        // finish() is a no-op once the success path has called it; this covers every error and cancellation.
+        let dumps = try options.dumps.map {
+            try DumpSet(options: $0, sourceWidth: srcW, sourceHeight: srcH, outputWidth: dstW, outputHeight: dstH)
+        }
+        defer { try? dumps?.finish() }
         let engine: VideoFrameEngine
         switch options.engine {
         case .metalfx:
@@ -81,7 +89,8 @@ public enum VideoUpscaler {
                 throw UpscaleError.scalerUnavailable("The ml engine needs macOS 26 or later.")
             }
             engine = try AppleMLEngine(
-                sourceWidth: srcW, sourceHeight: srcH, outputWidth: dstW, outputHeight: dstH, color: colorProperties)
+                sourceWidth: srcW, sourceHeight: srcH, outputWidth: dstW, outputHeight: dstH, color: colorProperties,
+                dumps: dumps)
         }
 
         let start = CMTime(seconds: options.start ?? 0, preferredTimescale: 600)
@@ -176,6 +185,7 @@ public enum VideoUpscaler {
             if reader.status == .failed { throw reader.error ?? UpscaleError.io("Decoding failed.") }
             await writer.finishWriting()
             guard writer.status == .completed else { throw writer.error ?? UpscaleError.io("Encoding failed.") }
+            try dumps?.finish()
         } catch {
             reader.cancelReading()
             writer.cancelWriting()
@@ -185,6 +195,24 @@ public enum VideoUpscaler {
         return Summary(
             sourceWidth: srcW, sourceHeight: srcH, outputWidth: dstW, outputHeight: dstH,
             frames: frames.value, bitrate: bitrate, elapsed: clock.elapsedSeconds, engine: engine.label)
+    }
+
+    /// Rejects option combinations that can't work for a source/output size pair, before any file is touched.
+    static func validate(
+        _ options: Options, sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int
+    ) throws {
+        guard let dumps = options.dumps else { return }
+        guard options.engine == .ml else {
+            throw UpscaleError.unsupportedInput("Frame dumps (--dump-*) need --engine ml.")
+        }
+        _ = try baseScale(
+            sourceWidth: sourceWidth, sourceHeight: sourceHeight, outputWidth: outputWidth, outputHeight: outputHeight)
+        if let crop = dumps.crop {
+            guard crop.x + crop.width <= sourceWidth, crop.y + crop.height <= sourceHeight else {
+                throw UpscaleError.unsupportedInput(
+                    "The crop \(crop.x),\(crop.y),\(crop.width),\(crop.height) doesn't fit inside the \(sourceWidth)x\(sourceHeight) source.")
+            }
+        }
     }
 
     /// Feeds `input` from `next` (which returns false when its source is exhausted) until done.

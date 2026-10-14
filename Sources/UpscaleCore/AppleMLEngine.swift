@@ -4,28 +4,23 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
-/// Apple's ML video super-resolution (VideoToolbox `VTSuperResolutionScaler`).
-///
-/// The model only supports 4×, so each frame is upscaled 4× in half-float RGBA and then resized to the
-/// requested size (e.g. 720p → 5120x2880 → 3840x2160; beyond 4× the resize finishes the job). The resize
-/// writes 10-bit 4:2:0 so the model's half-float precision isn't lost to 8-bit banding. It uses the
-/// previous frame for temporal stability, so frames must arrive in order.
+/// Apple's ML video super-resolution model (VideoToolbox `VTSuperResolutionScaler`) and nothing else: it turns a
+/// decoded half-float RGBA frame into a 4× half-float RGBA frame. It keeps the previous source/output pair for
+/// temporal stability, so frames must arrive in order. `AppleMLEngine` resizes and converts its output for the
+/// encoder; the detail-layer dumps and the future `DetailEngine` use the 4× frame directly.
 @available(macOS 26.0, *)
-final class AppleMLEngine: VideoFrameEngine {
+final class AppleSuperResolution {
     static let scaleFactor = 4
 
-    let label = "Apple ML super-resolution (VideoToolbox, 4× then resized)"
-    let decodeAttributes: [String: Any]
-    let outputPixelFormat = PixelBuffers.tenBitYUV
+    /// Pixel buffer attributes the decoder should produce (the model's input: half-float RGBA).
+    let sourceAttributes: [String: Any]
 
     private let processor = VTFrameProcessor()
     private let pool: CVPixelBufferPool
-    private let transfer: VTPixelTransferSession
     private var previousSource: VTFrameProcessorFrame?
     private var previousOutput: VTFrameProcessorFrame?
 
-    /// `color` holds the AVVideoColor*Key tags the encoder is given, so the RGB → YCbCr conversion matches them.
-    init(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int, color: [String: String]) throws {
+    init(sourceWidth: Int, sourceHeight: Int) throws {
         let configuration = try AppleMLModel.configuration(width: sourceWidth, height: sourceHeight)
         guard configuration.configurationModelStatus == .ready else {
             throw UpscaleError.scalerUnavailable(
@@ -35,32 +30,22 @@ final class AppleMLEngine: VideoFrameEngine {
 
         var pool: CVPixelBufferPool?
         CVPixelBufferPoolCreate(nil, nil, configuration.destinationPixelBufferAttributes as CFDictionary, &pool)
-        var transfer: VTPixelTransferSession?
-        VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer)
-        guard let pool, let transfer else {
+        guard let pool else {
             processor.endSession()
             throw UpscaleError.scalerUnavailable("Could not set up buffers for ML super-resolution.")
         }
-        VTSessionSetProperty(transfer, key: kVTPixelTransferPropertyKey_DownsamplingMode, value: kVTDownsamplingMode_Average)
-        for (key, tag) in [
-            (kVTPixelTransferPropertyKey_DestinationColorPrimaries, AVVideoColorPrimariesKey),
-            (kVTPixelTransferPropertyKey_DestinationTransferFunction, AVVideoTransferFunctionKey),
-            (kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, AVVideoYCbCrMatrixKey),
-        ] {
-            if let value = color[tag] { VTSessionSetProperty(transfer, key: key, value: value as CFString) }
-        }
 
         self.pool = pool
-        self.transfer = transfer
-        self.decodeAttributes = configuration.sourcePixelBufferAttributes
+        self.sourceAttributes = configuration.sourcePixelBufferAttributes
     }
 
     deinit {
         processor.endSession()
-        VTPixelTransferSessionInvalidate(transfer)
     }
 
-    func process(_ source: CVPixelBuffer, at time: CMTime, into destination: CVPixelBuffer) throws {
+    /// Upscales `source` 4×. The returned buffer stays valid at least until the next call, because it is kept as the
+    /// previous output.
+    func upscale(_ source: CVPixelBuffer, at time: CMTime) throws -> CVPixelBuffer {
         var upscaled: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &upscaled)
         guard let upscaled,
@@ -85,12 +70,64 @@ final class AppleMLEngine: VideoFrameEngine {
             throw UpscaleError.scalerUnavailable("ML super-resolution failed at \(time.seconds)s: \(failure.localizedDescription)")
         }
 
+        previousSource = sourceFrame
+        previousOutput = outputFrame
+        return upscaled
+    }
+}
+
+/// The `ml` video engine: `AppleSuperResolution` (4×), then a resize to the requested size (e.g. 720p → 5120x2880 →
+/// 3840x2160; beyond 4× the resize finishes the job). The resize writes 10-bit 4:2:0 so the model's half-float
+/// precision isn't lost to 8-bit banding.
+@available(macOS 26.0, *)
+final class AppleMLEngine: VideoFrameEngine {
+    let label = "Apple ML super-resolution (VideoToolbox, 4× then resized)"
+    let decodeAttributes: [String: Any]
+    let outputPixelFormat = PixelBuffers.tenBitYUV
+
+    private let superResolution: AppleSuperResolution
+    private let transfer: VTPixelTransferSession
+    private let dumps: DumpSet?
+
+    /// `color` holds the AVVideoColor*Key tags the encoder is given, so the RGB → YCbCr conversion matches them.
+    /// `dumps`, when given, records each decoded frame and its 4× result alongside the encode.
+    init(
+        sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int, color: [String: String],
+        dumps: DumpSet? = nil
+    ) throws {
+        let superResolution = try AppleSuperResolution(sourceWidth: sourceWidth, sourceHeight: sourceHeight)
+
+        var transfer: VTPixelTransferSession?
+        VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer)
+        guard let transfer else {
+            throw UpscaleError.scalerUnavailable("Could not set up buffers for ML super-resolution.")
+        }
+        VTSessionSetProperty(transfer, key: kVTPixelTransferPropertyKey_DownsamplingMode, value: kVTDownsamplingMode_Average)
+        for (key, tag) in [
+            (kVTPixelTransferPropertyKey_DestinationColorPrimaries, AVVideoColorPrimariesKey),
+            (kVTPixelTransferPropertyKey_DestinationTransferFunction, AVVideoTransferFunctionKey),
+            (kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, AVVideoYCbCrMatrixKey),
+        ] {
+            if let value = color[tag] { VTSessionSetProperty(transfer, key: key, value: value as CFString) }
+        }
+
+        self.superResolution = superResolution
+        self.transfer = transfer
+        self.dumps = dumps
+        self.decodeAttributes = superResolution.sourceAttributes
+    }
+
+    deinit {
+        VTPixelTransferSessionInvalidate(transfer)
+    }
+
+    func process(_ source: CVPixelBuffer, at time: CMTime, into destination: CVPixelBuffer) throws {
+        let upscaled = try superResolution.upscale(source, at: time)
         let status = VTPixelTransferSessionTransferImage(transfer, from: upscaled, to: destination)
         guard status == noErr else {
             throw UpscaleError.scalerUnavailable("Resizing the ML output failed (\(status)).")
         }
-        previousSource = sourceFrame
-        previousOutput = outputFrame
+        try dumps?.record(source: source, upscaled: upscaled, at: time)
     }
 }
 
@@ -126,7 +163,7 @@ public enum AppleMLModel {
             throw UpscaleError.scalerUnavailable("Apple ML super-resolution isn't supported on this Mac (needs macOS 26+).")
         }
         guard let configuration = VTSuperResolutionScalerConfiguration(
-            frameWidth: width, frameHeight: height, scaleFactor: AppleMLEngine.scaleFactor, inputType: .video,
+            frameWidth: width, frameHeight: height, scaleFactor: AppleSuperResolution.scaleFactor, inputType: .video,
             // `.normal` is the only quality level VideoToolbox offers for super resolution (no `.quality` case).
             usePrecomputedFlow: false, qualityPrioritization: .normal,
             revision: VTSuperResolutionScalerConfiguration.defaultRevision)

@@ -19,6 +19,14 @@ let usage = """
       --duration <sec>   Video only: length of the excerpt, in seconds.
       --overwrite        Replace <output> if it already exists.
 
+    Frame dumps for detail-layer training (video, --engine ml, and an output size that is a whole
+    multiple of the source). Each directory gets one float16 CHW file per frame plus meta.json:
+      --dump-source DIR  The decoded source frames (RGB).
+      --dump-base DIR    Apple's 4x frames resized to the output size (RGB).
+      --dump-flow DIR    VideoToolbox optical flow between source frames (not available yet).
+      --dump-crop X,Y,W,H  Dump only this window, in source pixels (default: the whole frame).
+                         The base is cropped to the same window times the scale.
+
     Video is written as HEVC (.mp4 or .mov) with the audio copied untouched.
     Images are written in the format of the output extension (png, jpg, heic, tiff).
     """
@@ -33,6 +41,15 @@ struct Arguments {
     var start: Double?
     var duration: Double?
     var overwrite = false
+    var dumpSource: URL?
+    var dumpBase: URL?
+    var dumpFlow: URL?
+    var dumpCrop: CropRect?
+
+    var dumps: DumpOptions? {
+        guard dumpSource != nil || dumpBase != nil || dumpFlow != nil else { return nil }
+        return DumpOptions(source: dumpSource, base: dumpBase, flow: dumpFlow, crop: dumpCrop)
+    }
 
     static func parse(_ args: [String]) throws -> Arguments {
         var result = Arguments()
@@ -61,6 +78,10 @@ struct Arguments {
             case "--start": result.start = try number(for: arg)
             case "--duration": result.duration = try number(for: arg)
             case "--overwrite": result.overwrite = true
+            case "--dump-source": result.dumpSource = URL(fileURLWithPath: try value(for: arg))
+            case "--dump-base": result.dumpBase = URL(fileURLWithPath: try value(for: arg))
+            case "--dump-flow": result.dumpFlow = URL(fileURLWithPath: try value(for: arg))
+            case "--dump-crop": result.dumpCrop = try CropRect.parse(try value(for: arg))
             case "-h", "--help": print(usage); exit(0)
             default:
                 guard !arg.hasPrefix("--") else { throw UpscaleError.io("Unknown option \(arg).\n\n\(usage)") }
@@ -68,6 +89,9 @@ struct Arguments {
             }
         }
         guard positional.count == 2 else { throw UpscaleError.io(usage) }
+        if result.dumpCrop != nil && result.dumps == nil {
+            throw UpscaleError.io("--dump-crop needs --dump-source, --dump-base or --dump-flow.")
+        }
         result.input = URL(fileURLWithPath: positional[0])
         result.output = URL(fileURLWithPath: positional[1])
         return result
@@ -112,6 +136,7 @@ do {
         options.bitrate = args.bitrateMbps.map { Int($0 * 1_000_000) }
         options.start = args.start
         options.duration = args.duration
+        options.dumps = args.dumps
 
         var lastPrint = -1.0
         let summary = try await VideoUpscaler.upscale(input: args.input, output: args.output, options: options) { p in
@@ -133,6 +158,7 @@ do {
               HEVC \(String(format: "%.1f", Double(summary.bitrate) / 1e6)) Mbps → \(args.output.path) (\(fileSize(args.output)))
             """)
     } else if type?.conforms(to: .image) == true {
+        guard args.dumps == nil else { throw UpscaleError.unsupportedInput("Frame dumps (--dump-*) are video-only.") }
         guard args.engine == .metalfx else { throw UpscaleError.unsupportedInput("The ml engine is video-only for now.") }
         let summary = try ImageUpscaler.upscale(input: args.input, output: args.output, size: args.size)
         print("""
