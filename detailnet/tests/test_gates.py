@@ -17,8 +17,9 @@ C_CLIPS = ["c-static-foliage", "c-slow-gorge", "c-fast-waterfall", "c-water-clim
 G3_CLIPS = ["g3-lizard-grass", "g3-waterfall", "g3-wallaby-fast", "g3-frog-rain", "g3-cut-gorge"]
 
 REF = "apple-base"
+PAIRS = {"static": 40, "slow": 40, "fast": 20}  # scored pairs per motion bucket (metrics' flicker_pairs)
 APPLE = {"detail": 2.0, "jitter_all": 0.2, "jitter": {"static": 0.1, "slow": 0.2, "fast": 0.4},
-         "jitter_phase": [0.2, 0.2, 0.2, 0.2]}
+         "jitter_phase": [0.2, 0.2, 0.2, 0.2], "flicker_all": 2.0, "flicker_pairs": PAIRS}
 
 
 def put(root, clip, model, **metrics):
@@ -27,11 +28,13 @@ def put(root, clip, model, **metrics):
     (d / f"{model}.json").write_text(json.dumps({"clip": clip, "model": model, **metrics}))
 
 
-def scaled(ratio_detail=1.5, ratio_jitter=1.1, ratio_bucket=1.1, phase=(1.1, 1.1, 0.9, 0.9)):
-    """DetailNet metrics for a c-* clip as ratios of the apple ones."""
+def scaled(ratio_detail=1.5, ratio_jitter=1.1, ratio_bucket=1.1, phase=(1.1, 1.1, 0.9, 0.9), ratio_flicker=1.0,
+           pairs=None):
+    """DetailNet metrics for a c-* clip as ratios of the apple ones (the same scored pairs unless `pairs`)."""
     return {"detail": APPLE["detail"] * ratio_detail, "jitter_all": APPLE["jitter_all"] * ratio_jitter,
             "jitter": {k: v * ratio_bucket for k, v in APPLE["jitter"].items()},
-            "jitter_phase": [0.2 * p for p in phase]}
+            "jitter_phase": [0.2 * p for p in phase], "flicker_all": APPLE["flicker_all"] * ratio_flicker,
+            "flicker_pairs": {**PAIRS, **(pairs or {})}}
 
 
 def build(root, model="dn", lpips=(0.30, 0.30), leak=(5.0, 5.0), ref_over=None, **kw):
@@ -117,11 +120,16 @@ def test_ratios_are_means_over_clips_not_pooled(tmp_path):
 
 def test_bucket_ratio_uses_only_clips_that_have_the_bucket(tmp_path):
     build(tmp_path)
+    no_static = {**PAIRS, "static": 0}
     for clip in C_CLIPS[:4]:  # no static pairs in four clips on either side (null), the remaining one is at 1.1
-        put(tmp_path, clip, REF, **{**APPLE, "jitter": {"static": None, "slow": 0.2, "fast": 0.4}})
-        put(tmp_path, clip, "dn", **{**scaled(), "jitter": {"static": None, "slow": 0.22, "fast": 0.44}})
-    put(tmp_path, "c-cut-nest", "dn", **{**scaled(), "cut_leak": 5.0, "jitter": {"static": 0.0099, "slow": None, "fast": None}})
-    put(tmp_path, "c-cut-nest", REF, **{**APPLE, "jitter": {"static": 0.01, "slow": None, "fast": None}})
+        put(tmp_path, clip, REF, **{**APPLE, "jitter": {"static": None, "slow": 0.2, "fast": 0.4}, "flicker_pairs": no_static})
+        put(tmp_path, clip, "dn", **{**scaled(), "jitter": {"static": None, "slow": 0.22, "fast": 0.44},
+                                     "flicker_pairs": no_static})
+    static_only = {"static": 40, "slow": 0, "fast": 0}
+    put(tmp_path, "c-cut-nest", "dn", **{**scaled(), "cut_leak": 5.0, "jitter": {"static": 0.0099, "slow": None, "fast": None},
+                                         "flicker_pairs": static_only})
+    put(tmp_path, "c-cut-nest", REF, **{**APPLE, "jitter": {"static": 0.01, "slow": None, "fast": None},
+                                        "flicker_pairs": static_only})
     result = by_name(gates.check_gates("dn", tmp_path))
     assert result["jitter_static"].value == pytest.approx(0.99) and result["jitter_static"].passed
     assert result["jitter_slow"].value == pytest.approx(1.1) and result["jitter_slow"].passed
@@ -278,6 +286,122 @@ def test_information_block_does_not_affect_the_verdict_when_apple_is_missing(tmp
     assert gates.main(["dn", "--clips", str(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert "OVERALL: PASS" in out and "n/a" in out.partition("Information only")[2]
+
+
+# ---------------------------------------------------------------- the scored pairs behind the jitter gates
+
+def gate(root, name, model="dn"):
+    return by_name(gates.check_gates(model, root))[name]
+
+
+def test_jitter_gates_fail_when_the_model_is_scored_on_fewer_pairs_than_the_reference(tmp_path):
+    """Each model's jitter averages only the pairs its own flow mask covers; a model scored on 94 % of the reference's
+    pairs could be judged on its most stable frames, so the jitter gates FAIL, naming the clip and the counts."""
+    build(tmp_path)
+    put(tmp_path, "c-slow-gorge", "dn", **scaled(pairs={"slow": 37}))  # 37 / 40 = 92.5 %
+    results = by_name(gates.check_gates("dn", tmp_path))
+    failing = {name for name, g in results.items() if not g.passed}
+    assert failing == {"jitter_slow", "jitter_all"}  # the bucket's own gate, and the pooled one
+    for name in failing:
+        note = results[name].note
+        assert "c-slow-gorge" in note and "37" in note and "40" in note and "slow" in note, note
+        assert results[name].value == pytest.approx(1.1)  # the ratio is still shown
+    assert gates.main(["dn", "--clips", str(tmp_path)]) == 1
+
+
+def test_scored_pairs_at_95_percent_of_the_reference_pass(tmp_path):
+    build(tmp_path)
+    put(tmp_path, "c-slow-gorge", "dn", **scaled(pairs={"slow": 38}))  # 38 / 40 = 95 %
+    assert all(statuses(tmp_path).values())
+    put(tmp_path, "c-slow-gorge", "dn", **scaled(pairs={"slow": 50}))  # more pairs than the reference is fine
+    assert all(statuses(tmp_path).values())
+
+
+def test_a_bucket_shrinking_in_one_clip_fails_only_that_buckets_gate_and_jitter_all(tmp_path):
+    build(tmp_path)
+    put(tmp_path, "c-water-climbers", "dn", **scaled(pairs={"fast": 18}))  # 18 / 20 = 90 %
+    ok = statuses(tmp_path)
+    assert {name for name, passed in ok.items() if not passed} == {"jitter_fast", "jitter_all"}
+
+
+def test_a_bucket_null_for_the_model_but_present_for_the_reference_fails(tmp_path):
+    """The whole clip would otherwise drop out of the bucket gate silently (each bucket rests on two clips)."""
+    build(tmp_path)
+    put(tmp_path, "c-static-foliage", "dn", **{**scaled(), "jitter": {"static": None, "slow": 0.22, "fast": 0.44}})
+    got = gate(tmp_path, "jitter_static")
+    assert not got.passed and "c-static-foliage" in got.note and "null" in got.note and "dn" in got.note
+    assert got.value == pytest.approx(1.1)  # over the clips that have it in both
+    # also when the scored-pair counts were (wrongly) equal: the null itself is the failure
+    put(tmp_path, "c-static-foliage", "dn", **{**scaled(), "jitter_all": None})
+    got = gate(tmp_path, "jitter_all")
+    assert not got.passed and "c-static-foliage" in got.note and "null" in got.note
+
+
+def test_a_value_the_reference_lacks_is_skipped_for_the_ratio(tmp_path):
+    build(tmp_path)
+    put(tmp_path, "c-static-foliage", REF, **{**APPLE, "jitter": {"static": None, "slow": 0.2, "fast": 0.4},
+                                              "flicker_pairs": {**PAIRS, "static": 0}})
+    got = gate(tmp_path, "jitter_static")
+    assert got.passed and "4 c-*" in got.note  # the model has pairs the reference has not: no ratio, no failure
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1])
+@pytest.mark.parametrize("name,keys", [("detail", ("detail",)), ("jitter_all", ("jitter_all",)),
+                                       ("jitter_slow", ("jitter", "slow"))])
+def test_a_reference_value_at_or_below_zero_fails_its_gate_with_a_clear_message(tmp_path, name, keys, value):
+    build(tmp_path)
+    ref = json.loads(json.dumps(APPLE))
+    if len(keys) == 1:
+        ref[keys[0]] = value
+    else:
+        ref[keys[0]][keys[1]] = value
+    put(tmp_path, "c-slow-gorge", REF, **ref)
+    results = by_name(gates.check_gates("dn", tmp_path))
+    got = results[name]
+    assert not got.passed
+    assert "c-slow-gorge" in got.note and "apple-base" in got.note and ".".join(keys) in got.note
+    assert "positive" in got.note and str(value) in got.note
+    assert {n for n, g in results.items() if not g.passed} == {name}
+
+
+def test_metrics_without_flicker_pairs_fail_the_jitter_gates(tmp_path):
+    build(tmp_path)
+    stale = scaled()
+    del stale["flicker_pairs"]
+    put(tmp_path, "c-fast-waterfall", "dn", **stale)
+    ok = statuses(tmp_path)
+    assert {name for name, passed in ok.items() if not passed} == {"jitter_all", "jitter_static", "jitter_slow",
+                                                                   "jitter_fast"}
+    got = gate(tmp_path, "jitter_fast")
+    assert "flicker_pairs" in got.note and "c-fast-waterfall" in got.note
+
+
+def test_pulse_with_a_zero_phase_mean_fails_with_a_clear_message(tmp_path):
+    build(tmp_path, phase=(0.0, 0.0, 0.0, 0.0))
+    got = gate(tmp_path, "pulse")
+    assert not got.passed and "mean" in got.note and "0" in got.note and "no c-* clip" not in got.note
+
+
+# ---------------------------------------------------------------- information: raw flicker
+
+def test_raw_flicker_ratio_is_printed_as_information_and_not_gated(tmp_path, capsys):
+    build(tmp_path, ratio_flicker=3.0)  # far worse raw flicker: information only, the verdict stays PASS
+    assert gates.main(["dn", "--clips", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    head, _, info = out.partition("Information only")
+    assert "OVERALL: PASS" in head and "flicker_all" not in head
+    lines = [line for line in info.splitlines() if line.startswith("flicker_all")]
+    assert len(lines) == 2  # against apple-base, and in the block against the bench output
+    assert all("3.0000" in line for line in lines)
+    assert "raw flicker" in info and "not gated" in info
+    assert "PASS" not in info and "FAIL" not in info
+
+
+def test_raw_flicker_is_printed_with_the_apple_reference_too(tmp_path, capsys):
+    build(tmp_path, ratio_flicker=0.5)
+    gates.main(["dn", "--clips", str(tmp_path), "--reference", "apple"])
+    info = capsys.readouterr().out.partition("Information only")[2]
+    assert [line for line in info.splitlines() if line.startswith("flicker_all")] and "0.5000" in info
 
 
 def test_summary_argument_is_accepted_and_not_read(tmp_path):

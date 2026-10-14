@@ -18,8 +18,20 @@ Real-clip gates, over the c-* clips (the 720p -> 4K clips), as ratios MODEL / re
     detail          mean ratio of `detail` (gradient energy vs the bicubic) >= 1.5
     jitter_all      mean ratio of `jitter_all` <= 1.1
     jitter_static, jitter_slow, jitter_fast
-                    mean ratio of `jitter[bucket]`, over the clips that have that bucket in both models, <= 1.1 each
-    pulse           the mean of MODEL's per-clip `jitter_phase` vectors (4 phases, t mod 4); its max <= 1.1 x its mean
+                    mean ratio of `jitter[bucket]`, over the clips that have that bucket in the reference, <= 1.1 each
+    pulse           the mean of MODEL's per-clip `jitter_phase` vectors (4 phases: the frame's index within its shot,
+                    mod 4); its max <= 1.1 x its mean
+
+The jitter gates also check that MODEL was scored on the same pairs as the reference. bench/metrics.py averages a model's
+jitter only over the frame pairs its own optical flow tracks well (mask over 20 % of the frame), so a model that shimmers
+could be scored on its most stable pairs alone. Per clip and bucket, MODEL's `flicker_pairs[bucket]` must be at least 95 %
+of the reference's: a bucket gate checks its bucket, jitter_all every bucket. A value the reference has and MODEL has not
+(null: MODEL kept no pair of that bucket in that clip) is a FAIL too, since each bucket rests on two clips; a value only
+MODEL has is left out of the ratio (there is nothing to compare it with). A failing check FAILs the gate with the clip and
+the counts in the note; the ratio over the comparable clips is still shown. The pulse gate reads MODEL alone; a model
+whose pairs shrink fails jitter_all, so the overall verdict covers it.
+
+A ratio needs a positive reference value: a reference value at or below 0 FAILs that gate, naming the clip and the value.
 
 Other gates:
 
@@ -31,6 +43,10 @@ Other gates:
 
 Anything the gates need that is missing (a metrics file, a key, a clip) is a FAIL with a message saying what, never a crash and
 never a silent pass. Ratios are compared with a 1e-9 tolerance so a value exactly at its threshold passes.
+
+After the table, information only (never gated): the raw flicker ratio, `flicker_all` (the jitter numerator in luma levels,
+without the division by the gradient) MODEL / reference averaged over the c-* clips, and then the same numbers against the
+bench `apple` output.
 """
 import argparse
 import json
@@ -52,6 +68,7 @@ BUCKETS = ("static", "slow", "fast")
 DETAIL_MIN = 1.5
 JITTER_MAX = 1.1
 PULSE_MAX = 1.1
+PAIRS_MIN = 0.95  # MODEL's scored pairs per clip and bucket, as a share of the reference's
 TOLERANCE = 1e-9
 
 
@@ -65,7 +82,8 @@ class Gate(NamedTuple):
 
 
 class Missing(Exception):
-    """Something a gate needs is not there; the message says what."""
+    """A gate cannot be evaluated: something it needs is not there, or a value makes the comparison meaningless; the
+    message says what."""
 
 
 def scope(root, prefix):
@@ -101,24 +119,52 @@ def clips_of(root, prefix):
     return clips
 
 
-def mean_ratio(root, model, reference, prefix, *keys):
-    """(mean over the clips of model / reference, number of clips used) for metrics[keys]. A clip whose value is null in
-    either model is skipped; a missing file, or a key absent from a file, is an error."""
-    ratios = []
+def mean_ratio(root, model, reference, prefix, *keys, pairs=()):
+    """(mean over the clips of model / reference, number of clips used, problems) for metrics[keys]. A clip whose value
+    is null in the reference is skipped. `problems` lists what makes the gate fail although a mean could be computed: a
+    value null in the model only, a reference value <= 0 (that clip is left out of the mean), and, for every bucket in
+    `pairs`, the model scored on fewer than PAIRS_MIN of the reference's pairs. A missing file, a key absent from a
+    file, or no clip to take a mean over raises Missing."""
+    name = ".".join(keys)
+    ratios, problems = [], []
     for clip in clips_of(root, prefix):
         a, b = load(root, clip, model), load(root, clip, reference)
         for who, m in ((model, a), (reference, b)):
             if not _has(m, keys):
-                raise Missing(f"{clip}/metrics/{who}.json has no '{'.'.join(keys)}' (re-score the clip with the current bench/metrics.py)")
+                raise Missing(f"{clip}/metrics/{who}.json has no '{name}' (re-score the clip with the current bench/metrics.py)")
+        problems += pair_shortfall(clip, model, a, reference, b, pairs)
         x, y = field(a, *keys), field(b, *keys)
-        if x is None or y is None:
+        if y is None:
+            continue  # nothing to compare with (null in both, or the model has pairs the reference has not)
+        if x is None:
+            problems.append(f"{clip}: {name} is null for {model} but {y} for {reference} (the model kept no scored pair "
+                            "there, so the clip would drop out of the gate)")
             continue
         if y <= 0:
-            raise Missing(f"{clip}: {reference} {'.'.join(keys)} is {y}, a ratio is undefined")
+            problems.append(f"{clip}: {reference} {name} is {y}; a ratio needs a positive reference value")
+            continue
         ratios.append(x / y)
     if not ratios:
-        raise Missing(f"no {prefix}* clip has a value of '{'.'.join(keys)}' in both {model} and {reference}")
-    return float(np.mean(ratios)), len(ratios)
+        detail = f": {'; '.join(problems)}" if problems else ""
+        raise Missing(f"no {prefix}* clip has a value of '{name}' in both {model} and {reference} to compare{detail}")
+    return float(np.mean(ratios)), len(ratios), problems
+
+
+def pair_shortfall(clip, model, a, reference, b, buckets):
+    """Problems (strings) where `model`'s metrics `a` scored fewer than PAIRS_MIN of the pairs `reference`'s `b` did, per
+    bucket in `buckets`. Missing when a file has no flicker_pairs for them."""
+    if not buckets:
+        return []
+    counts = {}
+    for who, m in ((model, a), (reference, b)):
+        pairs = field(m, "flicker_pairs")
+        if not isinstance(pairs, dict) or any(not isinstance(pairs.get(k), (int, float)) for k in buckets):
+            raise Missing(f"{clip}/metrics/{who}.json has no 'flicker_pairs' for {', '.join(buckets)} (re-score the clip "
+                          "with the current bench/metrics.py)")
+        counts[who] = pairs
+    return [f"{clip}: {model} was scored on {counts[model][k]} {k} pairs, {reference} on {counts[reference][k]} "
+            f"(below {PAIRS_MIN:.0%}: its own flow mask dropped the rest, so it would be judged on a subset)"
+            for k in buckets if counts[model][k] < PAIRS_MIN * counts[reference][k] - TOLERANCE]
 
 
 def _has(metrics, keys):
@@ -144,8 +190,11 @@ def averaged_phase(root, model, prefix):
         values = [v[k] for v in vectors if v[k] is not None]
         averaged.append(float(np.mean(values)) if values else None)
     present = [v for v in averaged if v is not None]
-    if not present or np.mean(present) <= 0:
+    if not present:
         raise Missing(f"no {prefix}* clip has any jitter_phase pair")
+    if np.mean(present) <= 0:
+        raise Missing(f"the mean of {model}'s averaged jitter_phase is {float(np.mean(present))}; max / mean needs a "
+                      "positive mean")
     return averaged, len(vectors)
 
 
@@ -164,18 +213,22 @@ def check_gates(model, clips_root=CLIPS, reference=REFERENCE, leak_reference=BEN
     root = Path(clips_root)
     results = []
 
-    def ratio_gate(name, op, threshold, *keys):
+    def ratio_gate(name, op, threshold, *keys, pairs=()):
         try:
-            value, n = mean_ratio(root, model, reference, REAL_PREFIX, *keys)
+            value, n, problems = mean_ratio(root, model, reference, REAL_PREFIX, *keys, pairs=pairs)
         except Missing as error:
             results.append(failed(name, op, threshold, str(error)))
+            return
+        note = f"mean over {n} {REAL_PREFIX}* clips of {model} / {reference}"
+        if problems:
+            results.append(Gate(name, value, op, threshold, False, f"{note}; FAILED: {'; '.join(problems)}"))
         else:
-            results.append(judge(name, value, op, threshold, f"mean over {n} {REAL_PREFIX}* clips of {model} / {reference}"))
+            results.append(judge(name, value, op, threshold, note))
 
     ratio_gate("detail", ">=", DETAIL_MIN, "detail")
-    ratio_gate("jitter_all", "<=", JITTER_MAX, "jitter_all")
+    ratio_gate("jitter_all", "<=", JITTER_MAX, "jitter_all", pairs=BUCKETS)
     for bucket in BUCKETS:
-        ratio_gate(f"jitter_{bucket}", "<=", JITTER_MAX, "jitter", bucket)
+        ratio_gate(f"jitter_{bucket}", "<=", JITTER_MAX, "jitter", bucket, pairs=(bucket,))
 
     try:
         phase, n = averaged_phase(root, model, REAL_PREFIX)
@@ -230,14 +283,24 @@ def format_table(results):
     return "\n".join(lines)
 
 
-def format_info(results, reference):
-    """The same numbers against another reference, with no verdict. A number that cannot be computed shows n/a and why."""
-    lines = [f"Information only (not gated): the same numbers against the bench output `{reference}` (after the HEVC encode)",
-             f"{'gate':14s} {'value':>9s}   {'limit':>11s}  note"]
+def raw_flicker(model, clips_root, reference):
+    """Information row (a Gate whose verdict is never used): the mean over the c-* clips of MODEL / reference
+    `flicker_all`, the jitter numerator in luma levels without the division by the gradient."""
+    try:
+        value, n, problems = mean_ratio(Path(clips_root), model, reference, REAL_PREFIX, "flicker_all")
+    except Missing as error:
+        return Gate("flicker_all", None, "", None, False, f"raw flicker, not gated: {error}")
+    note = f"raw flicker, not gated: mean over {n} {REAL_PREFIX}* clips of {model} / {reference} (luma levels)"
+    return Gate("flicker_all", value, "", None, False, note + (f"; {'; '.join(problems)}" if problems else ""))
+
+
+def format_info(results, title):
+    """Rows with no verdict under `title`. A number that cannot be computed shows n/a and why."""
+    lines = [title, f"{'gate':14s} {'value':>9s}   {'limit':>11s}  note"]
     for g in results:
         value = "n/a" if g.value is None else f"{g.value:.4f}"
         limit = "" if g.threshold is None else f"{g.op} {g.threshold:.4f}"
-        lines.append(f"{g.name:14s} {value:>9s}   {limit:>11s}  {g.note}")
+        lines.append(f"{g.name:14s} {value:>9s}   {limit:>11s}  {g.note.replace('FAILED: ', '')}")
     return "\n".join(lines)
 
 
@@ -252,9 +315,15 @@ def main(argv=None):
     results = check_gates(args.model, args.clips, args.reference)
     print(f"model {args.model} vs {args.reference} (cut leak vs {BENCH_APPLE}); clips under {args.clips}")
     print(format_table(results))
+    print()
+    print(format_info([raw_flicker(args.model, args.clips, args.reference)],
+                      f"Information only (not gated): raw flicker against `{args.reference}`"))
     if args.reference != BENCH_APPLE:
         print()
-        print(format_info(check_gates(args.model, args.clips, BENCH_APPLE), BENCH_APPLE))
+        print(format_info(check_gates(args.model, args.clips, BENCH_APPLE)
+                          + [raw_flicker(args.model, args.clips, BENCH_APPLE)],
+                          f"Information only (not gated): the same numbers against the bench output `{BENCH_APPLE}` "
+                          "(after the HEVC encode)"))
     return 0 if all(g.passed for g in results) else 1
 
 
