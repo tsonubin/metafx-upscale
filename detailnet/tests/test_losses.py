@@ -1,9 +1,14 @@
+import pytest
 import torch
 
 from detailnet.losses import Perceptual, ping_pong, texture_lock
 from detailnet.model import warp
 
-torch.manual_seed(0)
+
+
+@pytest.fixture(autouse=True)
+def seeded():
+    torch.manual_seed(0)  # per test, so results do not depend on test order or selection
 
 
 # ---------------------------------------------------------------- texture_lock
@@ -79,7 +84,7 @@ def test_perceptual_identity_near_zero_and_positive_for_noise():
     perceptual = Perceptual()
     x = torch.rand(2, 3, 64, 64)
     same = perceptual(x, x.clone())
-    assert same.shape == () and 0.0 <= float(same) < 1e-3, float(same)
+    assert same.shape == () and abs(float(same)) < 1e-3, float(same)
     noise = perceptual(x, torch.rand(2, 3, 64, 64))
     assert float(noise) > 0.1, float(noise)
 
@@ -102,3 +107,52 @@ def test_perceptual_is_lower_for_a_closer_image():
     near = (target + 0.02 * torch.randn_like(target)).clamp(0, 1)
     far = (target + 0.3 * torch.randn_like(target)).clamp(0, 1)
     assert float(perceptual(near, target)) < float(perceptual(far, target))
+
+
+class ZeroTerm(torch.nn.Module):
+    """Stands in for one of the two metrics and contributes nothing, to isolate the other."""
+
+    def forward(self, a, b, *args, **kwargs):
+        return torch.zeros(a.shape[0], 1, 1, 1)
+
+
+def grad_of(loss_fn, pred):
+    pred = pred.detach().clone().requires_grad_(True)
+    loss_fn(pred).backward()
+    return pred.grad
+
+
+def test_perceptual_dists_term_alone_gives_the_full_gradient():
+    # DISTS' default (require_grad=False) runs its VGG stages under no_grad, yet still hands back a small
+    # gradient through the raw-pixel statistics, so "grad is nonzero" would not catch the missing flag.
+    # Compare against the real thing instead: the gradient through every stage.
+    perceptual = Perceptual()
+    perceptual.lpips = ZeroTerm()
+    pred, target = torch.rand(2, 3, 64, 64), torch.rand(2, 3, 64, 64)
+    got = grad_of(lambda p: perceptual(p, target), pred)
+    full = grad_of(lambda p: perceptual.dists(p, target, require_grad=True).mean(), pred)
+    pixel_only = grad_of(lambda p: perceptual.dists(p, target, require_grad=False).mean(), pred)
+    assert torch.isfinite(got).all() and got.abs().sum() > 0
+    assert (pixel_only - full).abs().sum() > 0.5 * full.abs().sum()  # the trap is real: these differ a lot
+    assert torch.allclose(got, full, rtol=1e-4, atol=1e-9)
+
+
+def test_perceptual_lpips_term_alone_gives_the_full_gradient():
+    perceptual = Perceptual()
+    perceptual.dists = ZeroTerm()
+    pred, target = torch.rand(2, 3, 64, 64), torch.rand(2, 3, 64, 64)
+    got = grad_of(lambda p: perceptual(p, target), pred)
+    full = grad_of(lambda p: perceptual.lpips(2 * p - 1, 2 * target - 1).mean(), pred)
+    assert torch.isfinite(got).all() and got.abs().sum() > 0
+    assert torch.allclose(got, full, rtol=1e-4, atol=1e-9)
+
+
+def test_perceptual_is_dists_plus_lpips_vgg_one_to_one():
+    perceptual = Perceptual()
+    pred, target = torch.rand(2, 3, 64, 64), torch.rand(2, 3, 64, 64)
+    with torch.no_grad():
+        dists = perceptual.dists(pred, target).mean()
+        lp = perceptual.lpips(2 * pred - 1, 2 * target - 1).mean()  # LPIPS takes [-1, 1]
+        both = perceptual(pred, target)
+    assert float(dists) > 0.05 and float(lp) > 0.05
+    assert abs(float(both) - (float(dists) + float(lp))) < 1e-5

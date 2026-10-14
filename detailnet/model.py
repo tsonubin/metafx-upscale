@@ -40,16 +40,23 @@ def upsample_flow(flow_px, s):
     return F.interpolate(flow_px, scale_factor=s, mode="bilinear", align_corners=False) * s
 
 
+def sample_positions(flow_px):
+    """(x, y), each (N, H, W): where p + flow_px(p) lands, in the pixels of flow_px's own grid."""
+    h, w = flow_px.shape[-2:]
+    ys, xs = torch.meshgrid(torch.arange(h, device=flow_px.device, dtype=flow_px.dtype),
+                            torch.arange(w, device=flow_px.device, dtype=flow_px.dtype), indexing="ij")
+    return xs + flow_px[:, 0], ys + flow_px[:, 1]
+
+
 def warp(x, flow_px):
     """Sample x (N, C, H, W) at p + flow_px(p); flow_px is (N, 2, H, W) = [dx, dy] in x's pixels.
     Bilinear, border padding (out-of-frame samples repeat the edge pixel)."""
     if flow_px.shape[-2:] != x.shape[-2:] or flow_px.shape[0] != x.shape[0] or flow_px.shape[1] != 2:
         raise ValueError(f"flow {tuple(flow_px.shape)} does not match image {tuple(x.shape)}")
     _, _, h, w = x.shape
-    ys, xs = torch.meshgrid(torch.arange(h, device=x.device, dtype=flow_px.dtype),
-                            torch.arange(w, device=x.device, dtype=flow_px.dtype), indexing="ij")
-    gx = (xs + flow_px[:, 0]) * (2.0 / max(w - 1, 1)) - 1.0  # align_corners=True: pixel i <-> -1 + 2i/(size-1)
-    gy = (ys + flow_px[:, 1]) * (2.0 / max(h - 1, 1)) - 1.0
+    px, py = sample_positions(flow_px)
+    gx = px * (2.0 / max(w - 1, 1)) - 1.0  # align_corners=True: pixel i <-> -1 + 2i/(size-1)
+    gy = py * (2.0 / max(h - 1, 1)) - 1.0
     grid = torch.stack((gx, gy), dim=-1)
     return F.grid_sample(x, grid.to(x.dtype), mode="bilinear", padding_mode="border", align_corners=True)
 
@@ -79,7 +86,10 @@ def tracking_maps(x_t, x_prev, flow4):
 
 def occlusion_mask(maps, flow4):
     """(N, 1, h, w) bool, True where the track can be trusted (visible, flow consistent):
-    luma error < 0.05 and fb^2 < 0.5 + 0.01 * (|b|^2 + |f|^2), with b = back and f = warp(fwd, back).
+    luma error < 0.05, fb^2 < 0.5 + 0.01 * (|b|^2 + |f|^2) with b = back and f = warp(fwd, back),
+    and the backward-flow target p + back(p) inside the frame (x in [0, W-1], y in [0, H-1]).
+    `warp` clamps to the border, so without the last test a pan would lock texture toward
+    border-replicated detail at the leading edge.
     `maps` is the output of `tracking_maps` for the same `flow4`. The forward-backward test is the
     standard squared form (the tolerance grows with the squared motion), so channel 1 (a length in
     pixels) is squared before it is compared."""
@@ -88,7 +98,10 @@ def occlusion_mask(maps, flow4):
     motion_sq = back.pow(2).sum(1, keepdim=True) + fwd.pow(2).sum(1, keepdim=True)
     luma_ok = maps[:, 0:1] < LUMA_TOLERANCE
     fb_ok = maps[:, 1:2].pow(2) < FB_ABSOLUTE + FB_RELATIVE * motion_sq
-    return luma_ok & fb_ok
+    h, w = back.shape[-2:]
+    px, py = sample_positions(back)
+    inside = ((px >= 0) & (px <= w - 1) & (py >= 0) & (py <= h - 1)).unsqueeze(1)
+    return luma_ok & fb_ok & inside
 
 
 def compose(base, detail, strength):

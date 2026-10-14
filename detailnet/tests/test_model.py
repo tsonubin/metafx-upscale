@@ -5,7 +5,11 @@ import torch.nn.functional as F
 from detailnet.model import (DetailNet, compose, depth_to_space, occlusion_mask, space_to_depth,
                              texture_only, tracking_maps, upsample_flow, warp)
 
-torch.manual_seed(0)
+
+
+@pytest.fixture(autouse=True)
+def seeded():
+    torch.manual_seed(0)  # per test, so results do not depend on test order or selection
 
 
 def energy(t):
@@ -63,13 +67,14 @@ def test_texture_only_keeps_hf():
 
 @pytest.mark.parametrize("s", [3, 2])
 def test_texture_only_zero_mean(s):
-    r = torch.randn(2, 3, 12 * s, 16 * s)
+    gen = torch.Generator().manual_seed(1234)
+    r = torch.randn(2, 3, 12 * s, 16 * s, generator=gen) + 0.5  # a DC offset must not leak into the texture
     assert abs(float(texture_only(r, s).mean())) < 1e-3
 
 
 def test_texture_only_shape_and_divisibility():
     assert texture_only(torch.rand(1, 3, 12, 18), 3).shape == (1, 3, 12, 18)
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="divisible"):
         texture_only(torch.rand(1, 3, 13, 18), 3)
 
 
@@ -183,13 +188,44 @@ def test_occlusion_mask_flags_luma_mismatch_and_fb_inconsistency():
 
 
 def test_occlusion_mask_fb_tolerance_grows_with_motion():
-    h, w = 8, 8
+    h, w = 8, 48
     maps = torch.zeros(1, 2, h, w)
     maps[:, 1] = 1.0  # 1 px inconsistency
     still = uniform_flow(1, h, w, back=(0.0, 0.0), fwd=(0.0, 0.0))
     moving = uniform_flow(1, h, w, back=(-20.0, 0.0), fwd=(20.0, 0.0))
     assert not occlusion_mask(maps, still).any()  # tolerance sqrt(0.5) px at rest
-    assert occlusion_mask(maps, moving).all()  # sqrt(0.5 + 0.01 * 800) px when moving fast
+    assert occlusion_mask(maps, moving)[..., 20:].all()  # sqrt(0.5 + 0.01 * 800) px when moving fast
+
+
+def test_occlusion_mask_fb_test_is_the_squared_form():
+    # The bound 0.5 + 0.01 * (|b|^2 + |f|^2) is for the squared inconsistency; each case here
+    # goes the other way if the plain length is compared instead.
+    h, w = 8, 48
+    maps = torch.zeros(1, 2, h, w)
+    still = uniform_flow(1, h, w, back=(0.0, 0.0), fwd=(0.0, 0.0))
+    moving = uniform_flow(1, h, w, back=(-20.0, 0.0), fwd=(20.0, 0.0))
+    maps[:, 1] = 0.6  # 0.36 < 0.5: kept at rest (0.6 >= 0.5 would be masked)
+    assert occlusion_mask(maps, still).all()
+    maps[:, 1] = 5.0  # 25 > 0.5 + 0.01 * 800 = 8.5: masked at 20 px motion (5 < 8.5 would be kept)
+    assert not occlusion_mask(maps, moving).any()
+
+
+def test_occlusion_mask_marks_pixels_whose_backward_target_is_outside_the_frame():
+    h, w = 6, 16
+    maps = torch.zeros(1, 2, h, w)  # a flawless track everywhere, so only the frame edge can mask
+    # pan: content moves right, so the pixels in the first 2 columns came from outside the frame
+    pan = uniform_flow(1, h, w, back=(-2.0, 0.0), fwd=(2.0, 0.0))
+    mask = occlusion_mask(maps, pan)
+    assert not mask[..., :2].any() and mask[..., 2:].all()  # x - 2 == 0 is still inside
+    # content moving left: the last 3 columns are masked (x + 3 > W - 1)
+    mask = occlusion_mask(maps, uniform_flow(1, h, w, back=(3.0, 0.0), fwd=(-3.0, 0.0)))
+    assert not mask[..., w - 3:].any() and mask[..., : w - 3].all()
+    # vertical, and fractional: x + back = -0.5 is outside, 0.5 inside
+    mask = occlusion_mask(maps, uniform_flow(1, h, w, back=(-0.5, 1.0), fwd=(0.5, -1.0)))
+    assert not mask[..., 0].any() and not mask[:, :, h - 1].any()
+    assert mask[:, :, : h - 1, 1:].all()
+    # no motion: nothing is outside
+    assert occlusion_mask(maps, torch.zeros(1, 4, h, w)).all()
 
 
 # ---------------------------------------------------------------- recurrence
@@ -227,19 +263,78 @@ def test_gradients_reach_every_layer_despite_near_zero_head():
     assert net.conv_in.weight.grad.abs().max() > 0
 
 
-def test_hidden_and_detail_are_warped_by_back_flow():
-    n, h, w, s = 1, 16, 16, 3
-    net = DetailNet(scale=s, channels=16, blocks=2).eval()
+def conv_in_stack(net, *args):
+    """The input stack the first conv sees, captured with a forward-pre-hook."""
+    captured = []
+    handle = net.conv_in.register_forward_pre_hook(lambda module, inputs: captured.append(inputs[0].detach().clone()))
+    try:
+        with torch.no_grad():
+            net(*args)
+    finally:
+        handle.remove()
+    assert len(captured) == 1
+    return captured[0]
+
+
+@pytest.mark.parametrize("s, channels_in", [(3, 91), (2, 61)])
+def test_input_stack_layout(s, channels_in):
+    n, h, w = 2, 10, 12
+    net = DetailNet(scale=s, channels=8, blocks=1).eval()
+    x_t, x_prev, base, _ = make_inputs(n, h, w, s)
+    flow = torch.randn(n, 4, h, w) * 2  # fractional flow in both directions
+    hidden = torch.tanh(torch.randn(n, 32, h, w))
+    prev_detail = torch.randn(n, 3, s * h, s * w)
+    stack = conv_in_stack(net, x_t, x_prev, base, flow, prev_detail, hidden)
+
+    back = flow[:, 0:2]
+    expected = [
+        x_t,
+        space_to_depth(base, s),
+        space_to_depth(warp(prev_detail, upsample_flow(back, s)), s),
+        warp(hidden, back),
+        tracking_maps(x_t, x_prev, flow),
+    ]
+    assert [e.shape[1] for e in expected] == [3, 3 * s * s, 3 * s * s, 32, 2]
+    assert stack.shape == (n, channels_in, h, w)
+    assert net.conv_in.in_channels == channels_in
+    start = 0
+    for index, e in enumerate(expected):
+        part = stack[:, start:start + e.shape[1]]
+        assert torch.equal(part, e), f"slice {index} of the input stack is not what the brief lists"
+        start += e.shape[1]
+    assert start == channels_in
+    # the warped slices really differ from the unwarped tensors, so the equalities above are not vacuous
+    assert (expected[3] - hidden).abs().max() > 1e-3
+    assert (expected[2] - space_to_depth(prev_detail, s)).abs().max() > 1e-3
+
+
+def test_input_stack_warps_by_back_flow_scaled_to_each_grid():
+    s, n, h, w = 3, 1, 14, 16
+    net = DetailNet(scale=s, channels=8, blocks=1).eval()
     x_t, x_prev, base, _ = make_inputs(n, h, w, s)
     hidden = torch.tanh(torch.randn(n, 32, h, w))
     prev_detail = torch.randn(n, 3, s * h, s * w)
-    still = torch.zeros(n, 4, h, w)
-    moved = uniform_flow(n, h, w, back=(-3.0, 1.0), fwd=(3.0, -1.0))
-    with torch.no_grad():
-        d0, h0 = net(x_t, x_prev, base, still, prev_detail, hidden)
-        d1, h1 = net(x_t, x_prev, base, moved, prev_detail, hidden)
-    assert (h0 - h1).abs().max() > 1e-4  # the flow reaches the network
-    assert (d0 - d1).abs().max() > 0
+    dx, dy = -2, 1  # back flow in source pixels: the pixel at (x, y) was at (x + dx, y + dy) in t-1
+    flow = uniform_flow(n, h, w, back=(float(dx), float(dy)), fwd=(float(-dx), float(-dy)))
+    stack = conv_in_stack(net, x_t, x_prev, base, flow, prev_detail, hidden)
+
+    # memory: shifted by the flow in source pixels
+    hidden_slice = stack[:, 3 + 6 * s * s: 3 + 6 * s * s + 32]
+    got = hidden_slice[..., 0:h - dy, -dx:]  # interior: y + dy <= h - 1, x + dx >= 0
+    assert (got - hidden[..., dy:h, 0:w + dx]).abs().max() < 1e-5
+    assert (hidden_slice - hidden).abs().max() > 1e-2  # the memory did move
+
+    # texture: shifted by s x the flow, in output pixels
+    hr_slice = depth_to_space(stack[:, 3 + 3 * s * s: 3 + 6 * s * s], s)
+    hdx, hdy = s * dx, s * dy
+    hh, hw = s * h, s * w
+    interior = hr_slice[..., 0:hh - hdy, -hdx:]
+    shifted = prev_detail[..., hdy:hh, 0:hw + hdx]
+    assert interior.shape == shifted.shape
+    assert (interior - shifted).abs().max() < 1e-4  # float32 grid_sample positions, on unit-variance noise
+    # and not by the unscaled flow
+    wrong = prev_detail[..., dy:hh, 0:hw + dx]
+    assert (hr_slice[..., 0:hh - dy, -dx:] - wrong).abs().max() > 1e-2
 
 
 def test_zero_state_on_requested_size():
