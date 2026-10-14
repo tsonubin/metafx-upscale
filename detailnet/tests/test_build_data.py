@@ -492,3 +492,78 @@ def test_main_exit_code_3_when_swap_grows(tmp_path, monkeypatch):
     listing = json.loads((tmp_path / "out" / "sequences.json").read_text())
     assert [(e["kind"], e["id"]) for e in listing] == [("teacher", 0), ("teacher", 1), ("teacher", 2),
                                                        ("gt", 0), ("gt", 1)]
+
+
+# ---------------------------------------------------------------- a changed plan is not applied silently
+
+def planned_main(tmp_path, monkeypatch, plans):
+    """main() with the sampler's plan taken from `plans` (a dict kind -> specs, swapped by the test between runs), no
+    episodes and no building; -> (run, runs) where run(*extra) calls main and runs lists the runs that got to building."""
+    binary = tmp_path / "metalfx-upscale"
+    binary.write_text("")
+    monkeypatch.setattr(build_data, "plan", lambda kind, n, seed, shots: plans[kind])
+    monkeypatch.setattr(build_data, "load_episodes", lambda d, kind: {})
+    runs = []
+    monkeypatch.setattr(build_data, "run_all", lambda builder, specs, *a, **k: runs.append(specs) or (0, {}))
+    args = ["--out", str(tmp_path / "out"), "--teacher-seqs", "3", "--gt-seqs", "2", "--binary", str(binary)]
+    return (lambda *extra: build_data.main(args + list(extra))), runs
+
+
+def test_rerun_with_the_same_plan_resumes(tmp_path, monkeypatch):
+    plans = specs_by_kind()
+    run, runs = planned_main(tmp_path, monkeypatch, plans)
+    assert run() == 0 and run() == 0
+    assert len(runs) == 2
+
+
+@pytest.mark.parametrize("change", ["more", "fewer", "moved"])
+def test_a_changed_plan_is_refused_and_leaves_sequences_json_alone(tmp_path, monkeypatch, capsys, change):
+    """sample() is not prefix-stable: a larger --teacher-seqs (or another seed) changes earlier sequences too, and the
+    builder would then delete every changed sequence directory without teacher/ and orphan the teacher ones."""
+    plans = specs_by_kind()
+    run, runs = planned_main(tmp_path, monkeypatch, plans)
+    assert run() == 0
+    listing = tmp_path / "out" / "sequences.json"
+    before = listing.read_bytes()
+    if change == "more":
+        plans["teacher"] = specs_by_kind(teacher=4)["teacher"]
+    elif change == "fewer":
+        plans["gt"] = plans["gt"][:1]
+    else:
+        plans["teacher"] = [plans["teacher"][0], make_spec("teacher", start=999), plans["teacher"][2]]
+    with pytest.raises(SystemExit) as refused:
+        run()
+    message = str(refused.value)
+    assert refused.value.code != 0 and "--replan" in message and "sequences.json" in message
+    assert listing.read_bytes() == before  # not rewritten before the check
+    assert len(runs) == 1  # nothing was built or deleted
+
+
+def test_replan_applies_a_changed_plan(tmp_path, monkeypatch):
+    plans = specs_by_kind()
+    run, runs = planned_main(tmp_path, monkeypatch, plans)
+    assert run() == 0
+    plans["teacher"] = specs_by_kind(teacher=4)["teacher"]
+    assert run("--replan") == 0
+    listing = json.loads((tmp_path / "out" / "sequences.json").read_text())
+    assert [(e["kind"], e["id"]) for e in listing][:4] == [("teacher", i) for i in range(4)]
+    assert len(runs) == 2 and len(runs[1]["teacher"]) == 4
+    assert run() == 0  # the new plan is now the recorded one
+
+
+def test_an_unreadable_sequences_json_is_refused_without_replan(tmp_path, monkeypatch):
+    plans = specs_by_kind()
+    run, runs = planned_main(tmp_path, monkeypatch, plans)
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "sequences.json").write_text("{not json")
+    with pytest.raises(SystemExit, match="--replan"):
+        run()
+    assert (tmp_path / "out" / "sequences.json").read_text() == "{not json" and not runs
+    assert run("--replan") == 0 and len(runs) == 1
+
+
+def test_the_first_run_writes_sequences_json(tmp_path, monkeypatch):
+    run, runs = planned_main(tmp_path, monkeypatch, specs_by_kind())
+    assert not (tmp_path / "out" / "sequences.json").exists()
+    assert run() == 0
+    assert len(json.loads((tmp_path / "out" / "sequences.json").read_text())) == 5

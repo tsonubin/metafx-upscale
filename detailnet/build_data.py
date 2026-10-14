@@ -19,6 +19,12 @@ range) and `-ss i / fps` for ffmpeg (keeps frames at or after the time) both sel
 half a frame so rounding in either tool cannot move the boundary. `detailnet/check_alignment.py` re-verifies a built
 sequence against ffmpeg.
 
+The plan is fixed once written: when `sequences.json` exists and the sampler's plan for these arguments differs (another
+--teacher-seqs, --gt-seqs or --seed, or new shot maps; the sampler is not prefix-stable, so asking for more sequences
+changes earlier ones too), the run is refused before anything is written or deleted, unless `--replan` is passed.
+A replan rebuilds every sequence whose spec changed (deleting its dumps) and leaves those holding teacher/ targets as
+STALE-KEPT (see below).
+
 Resumable: a sequence is skipped only when its spec.json matches and every dump's meta.json holds burn_in + frames
 frames; anything else is deleted and rebuilt, except a directory that already holds teacher/ targets (FlashVSR costs
 seconds per frame): that one is kept, logged STALE-KEPT and counted as failed, unless `--rebuild` is passed. Sequences
@@ -385,12 +391,37 @@ def hms(seconds):
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+def sequences_listing(specs_by_kind):
+    """The rows of sequences.json: every kind's list, with the ids the directories use."""
+    return [{"id": i, **asdict(s)} for kind in KINDS for i, s in enumerate(specs_by_kind.get(kind, []))]
+
+
 def write_sequences(out, specs_by_kind):
     """sequences.json: every kind's list, with the ids the directories use."""
-    listing = [{"id": i, **asdict(s)} for kind in KINDS for i, s in enumerate(specs_by_kind.get(kind, []))]
+    listing = sequences_listing(specs_by_kind)
     tmp = Path(out) / "sequences.json.tmp"
     tmp.write_text(json.dumps(listing, indent=1) + "\n")
     tmp.replace(Path(out) / "sequences.json")
+
+
+def plan_change(out, specs_by_kind):
+    """None when <out>/sequences.json is absent or lists exactly this plan; otherwise what differs, in words."""
+    path = Path(out) / "sequences.json"
+    if not path.exists():
+        return None
+    try:
+        recorded = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        return f"it cannot be read ({error})"
+    planned = json.loads(json.dumps(sequences_listing(specs_by_kind)))
+    if recorded == planned:
+        return None
+
+    def count(rows, kind):
+        return sum(1 for r in rows if isinstance(r, dict) and r.get("kind") == kind)
+    sizes = ", ".join(f"{kind} {count(recorded, kind)} -> {count(planned, kind)}" for kind in KINDS)
+    changed = sum(1 for a, b in zip(recorded, planned) if a != b) + abs(len(recorded) - len(planned))
+    return f"it lists another plan ({sizes}; {changed} rows differ)"
 
 
 def run_all(builder, specs_by_kind, limit, guard, log=print):
@@ -452,6 +483,8 @@ def main(argv=None):
     parser.add_argument("--swap-limit-gb", type=float, default=8.0)
     parser.add_argument("--rebuild", action="store_true",
                         help="also delete and rebuild stale sequences that already hold teacher/ targets")
+    parser.add_argument("--replan", action="store_true",
+                        help="replace an existing sequences.json that lists another plan (changed sequences are rebuilt)")
     args = parser.parse_args(argv)
 
     if not Path(args.binary).exists():
@@ -465,6 +498,15 @@ def main(argv=None):
     for kind in KINDS:
         if len(specs[kind]) < counts[kind]:
             print(f"warning: the sampler found only {len(specs[kind])} of {counts[kind]} {kind} sequences", flush=True)
+    change = plan_change(out, specs)
+    if change and not args.replan:
+        raise SystemExit(f"refusing to start: {out / 'sequences.json'} exists and {change}. These arguments "
+                         f"(--teacher-seqs {args.teacher_seqs} --gt-seqs {args.gt_seqs} --seed {args.seed}) plan other "
+                         "sequences, and building them would delete the dumps of every sequence whose spec changed "
+                         "(and leave its teacher/ targets stale). Rerun with the arguments of the existing plan to "
+                         "resume it, or pass --replan to replace the plan on purpose.")
+    if change:
+        print(f"replanning: {out / 'sequences.json'} {change}", flush=True)
     write_sequences(out, specs)
     episodes = {}
     for kind in KINDS:
