@@ -294,6 +294,64 @@ def test_missing_or_mismatched_dumps_fail_clearly(tmp_path):
         run_frames(net, tmp_path)
 
 
+# ---------------------------------------------------------------- run_bench --base-only (the apple-base reference)
+
+def test_base_only_is_the_strength_zero_composite_bit_for_bit(tmp_path):
+    data = synth(4)
+    write_clip(tmp_path, data, clip_spec(4, cuts=[2]))
+    zero = run_frames(small_net(boost=True), tmp_path, strength=0.0)
+    base = {t: img for t, img, _ in run_bench.iter_outputs(None, tmp_path, device="cpu")}
+    assert sorted(base) == [0, 1, 2, 3]
+    assert all(np.array_equal(base[t], zero[t]) for t in range(4))
+    assert all(max_diff(base[t], to_u8(data.base[t])) <= 1 for t in range(4))
+
+
+def test_base_only_cuts_the_same_margin(tmp_path):
+    spec = clip_spec(3, kind="real", h=82, w=96, target=(3840, 2160))
+    spec["lr_size"] = [1280, 720]
+    data = synth(3, h=82, w=96)
+    write_clip(tmp_path, data, spec, crop_size=(96, 54))
+    zero = run_frames(small_net(), tmp_path, strength=0.0, crop_size=(96, 54))
+    base = {t: img for t, img, _ in run_bench.iter_outputs(None, tmp_path, device="cpu", crop_size=(96, 54))}
+    assert all(base[t].shape == (54, 96, 3) and np.array_equal(base[t], zero[t]) for t in range(3))
+
+
+def test_base_only_main_needs_no_checkpoint_and_writes_the_stats_format(tmp_path):
+    data = synth(4)
+    write_clip(tmp_path / "t-clip", data, clip_spec(4, cuts=[2]))
+    clip = str(tmp_path / "t-clip")
+    assert run_bench.main(["--base-only", "--name", "apple-base", clip]) == 0
+    assert run_bench.main(["--base-only", "--name", "apple-base", "--ignore-cuts", clip]) == 0
+    out = tmp_path / "t-clip" / "out"
+    assert sorted(p.name for p in out.iterdir()) == ["apple-base-nocut.json", "apple-base-nocut.mkv",
+                                                     "apple-base.json", "apple-base.mkv"]
+    stats = json.loads((out / "apple-base.json").read_text())
+    assert stats["model"] == "apple-base" and stats["clip"] == "t-clip" and stats["strength"] == 0.0
+    assert stats["ckpt"] is None and stats["ignore_cuts"] is False and stats["frames"] == 4
+    assert stats["center_crop"] is False and stats["out_size"] == [3 * W, 3 * H]
+    assert stats["frame_pixels"] == 16 * W * H and stats["peak_gpu_gb"] is None
+    for key in ("label", "seconds", "s_per_frame", "note"):
+        assert key in stats
+    assert json.loads((out / "apple-base-nocut.json").read_text())["ignore_cuts"] is True
+    frames = list(read_frames(out / "apple-base.mkv", 3 * W, 3 * H))
+    carried = list(read_frames(out / "apple-base-nocut.mkv", 3 * W, 3 * H))  # no state: ignoring cuts changes nothing
+    assert len(frames) == 4 and all(np.array_equal(frames[t], carried[t]) for t in range(4))
+    assert all(max_diff(frames[t], to_u8(data.base[t])) <= 1 for t in range(4))
+
+
+def test_checkpoint_is_required_exactly_when_not_base_only(tmp_path, capsys):
+    write_clip(tmp_path / "t-clip", synth(2), clip_spec(2))
+    clip = str(tmp_path / "t-clip")
+    ckpt = tmp_path / "net.pt"
+    save_ckpt(ckpt, small_net())
+    with pytest.raises(SystemExit):
+        run_bench.main(["--name", "dn", clip])
+    with pytest.raises(SystemExit):
+        run_bench.main(["--base-only", "--ckpt", str(ckpt), "--name", "apple-base", clip])
+    err = capsys.readouterr().err
+    assert "--ckpt" in err and "--base-only" in err
+
+
 # ---------------------------------------------------------------- bench_dumps
 
 def real_spec(frames=150, cuts=(75,)):

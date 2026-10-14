@@ -2,6 +2,7 @@
 
     python -m detailnet.run_bench --ckpt output/detail-runs/r1/latest.pt --name dn-r1 [--strength 1.0] [--ignore-cuts]
                                   [--device mps] output/sr-bench/clips/c-* output/sr-bench/clips/g3-*
+    python -m detailnet.run_bench --base-only --name apple-base output/sr-bench/clips/c-* output/sr-bench/clips/g3-*
 
 Input is `python -m detailnet.bench_dumps CLIP_DIR...`: per shot, the source frames, Apple AI's x3 base and the optical
 flow. Output is CLIP_DIR/out/NAME.mkv (lossless FFV1, like every bench output) and NAME.json (the stats format of
@@ -22,6 +23,11 @@ base crop back exactly.
 carried over instead: the flow is zero there (a shot start has no flow), x_prev is the previous frame, and prev_detail and
 hidden keep their values; invalid flow elsewhere still restarts the state. Both runs use the same per-shot dumps, so the
 difference between them is DetailNet's own leak over the same base.
+
+--base-only needs no checkpoint and writes the strength-0 composite: the dumped base cut to the same geometry, in the same
+out/ format. That is Apple AI's output before the bench's HEVC encode, exactly what DetailNet adds to, and it is the
+reference `bench/gates.py` compares with (`apple-base`). It carries no state, so --ignore-cuts writes `apple-base-nocut`
+with identical frames (cut leak 0), which only exists so `gates.py apple-base` can read a cut_leak.
 
 `frame_pixels` is the 4x-equivalent pixel count of the processed region (16 x LR pixels), the unit `bench/run_model.py`
 uses for its 4x models, so `bench/summarize.py` scales the seconds per frame to a full 720p frame correctly.
@@ -94,20 +100,52 @@ def margin_of(clip, crop_size):
     return round(margin * ratio)
 
 
-def iter_outputs(net, clip_dir, strength=1.0, ignore_cuts=False, device="cpu", crop_size=CROP):
-    """Yield (frame index, uint8 HxWx3 RGB output frame, seconds of compute) for every frame of the clip's dumps, in
-    order. A warm-up pass on the first frame (not timed, not kept) comes before the first yield."""
+def to_frame(out, m):
+    """(3, H, W) float image in [0, 1] -> uint8 HxWx3 numpy, with `m` px cut off every side."""
+    if m:
+        out = out[:, m:-m, m:-m]
+    return out.mul(255.0).round_().to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
+
+
+def prepare(clip_dir, crop_size):
+    """(clip, plan, shots, margin) of a clip's dumps, checked against the clip.json and the requested output size."""
     clip_dir = Path(clip_dir)
     clip = json.loads((clip_dir / "clip.json").read_text())
     plan = dump_plan(clip, crop_size)
-    if net.scale != plan.scale:
-        raise DumpError(f"the network is x{net.scale} but {clip['name']} is a x{plan.scale} clip")
     shots = find_shots(clip_dir, clip, plan)
     m = margin_of(clip, crop_size)
     h, w = plan.crop[3], plan.crop[2]
     out_size = (plan.scale * w - 2 * m, plan.scale * h - 2 * m)
     if m and out_size != tuple(crop_size):
         raise DumpError(f"{clip['name']}: the dumps give a {out_size} output, expected {tuple(crop_size)}")
+    return clip, plan, shots, m
+
+
+def iter_base(clip_dir, crop_size=CROP):
+    """The `net is None` case of iter_outputs: the dumped base, cut to the output geometry, with no network."""
+    _, _, shots, m = prepare(clip_dir, crop_size)
+    t = 0
+    with torch.inference_mode():
+        for shot in shots:
+            for i in range(len(shot)):
+                started = time.perf_counter()
+                base = torch.from_numpy(read_frame(shot.dir / "base", i).astype(np.float32))
+                seconds = time.perf_counter() - started
+                yield t, to_frame(base.clamp(0.0, 1.0), m), seconds  # compose(base, d, 0.0) is exactly this
+                t += 1
+
+
+def iter_outputs(net, clip_dir, strength=1.0, ignore_cuts=False, device="cpu", crop_size=CROP):
+    """Yield (frame index, uint8 HxWx3 RGB output frame, seconds of compute) for every frame of the clip's dumps, in
+    order. A warm-up pass on the first frame (not timed, not kept) comes before the first yield. With net=None the
+    frames are the dumped base itself (strength 0, no network; --base-only)."""
+    if net is None:
+        yield from iter_base(clip_dir, crop_size)
+        return
+    clip, plan, shots, m = prepare(clip_dir, crop_size)
+    if net.scale != plan.scale:
+        raise DumpError(f"the network is x{net.scale} but {clip['name']} is a x{plan.scale} clip")
+    h, w = plan.crop[3], plan.crop[2]
 
     net = net.to(device).eval()
     with torch.inference_mode():
@@ -138,10 +176,7 @@ def iter_outputs(net, clip_dir, strength=1.0, ignore_cuts=False, device="cpu", c
                 if zero_flow:
                     flow = torch.zeros_like(flow)
                 detail, hidden = net(x, x_prev, base, flow, prev_detail, hidden)
-                out = compose(base, detail, strength)[0]
-                if m:
-                    out = out[:, m:-m, m:-m]
-                frame = out.mul(255.0).round_().to(torch.uint8).permute(1, 2, 0).contiguous().cpu().numpy()
+                frame = to_frame(compose(base, detail, strength)[0], m)
                 seconds = time.perf_counter() - started
                 prev_detail, prev_x = detail, x
                 yield t, frame, seconds
@@ -149,7 +184,11 @@ def iter_outputs(net, clip_dir, strength=1.0, ignore_cuts=False, device="cpu", c
 
 
 def run_clip(net, clip_dir, name, strength=1.0, ignore_cuts=False, device="mps", ckpt=None, crop_size=CROP):
-    """Run `net` over one clip and write out/NAME[-nocut].{mkv,json}; -> the stats dict."""
+    """Run `net` over one clip and write out/NAME[-nocut].{mkv,json}; -> the stats dict. net=None is the base-only
+    reference: the dumped base, strength 0, no network and no device."""
+    base_only = net is None
+    if base_only:
+        strength, device = 0.0, "cpu"
     clip_dir = Path(clip_dir)
     clip = json.loads((clip_dir / "clip.json").read_text())
     plan = dump_plan(clip, crop_size)
@@ -175,10 +214,14 @@ def run_clip(net, clip_dir, name, strength=1.0, ignore_cuts=False, device="mps",
     writer.close()
     assert frames == plan.frames, f"wrote {frames}/{plan.frames} frames"
     peak = torch.mps.driver_allocated_memory() / 2**30 if torch.device(device).type == "mps" else None
-    stats = {"model": name, "label": f"DetailNet ({name})", "frames": frames, "seconds": round(seconds, 2),
+    label = "Apple AI base, before the bench encode (dump)" if base_only else f"DetailNet ({name})"
+    note = ("the dumped Apple AI base cut to the output geometry (strength 0, no network); no compute to speak of"
+            if base_only else
+            f"DetailNet compute + compose + crop to 8 bit on {device}, strength {strength}; excl. dump reading, "
+            "video writing and the Apple AI base (Apple's own run); batch job running concurrently on GPU")
+    stats = {"model": name, "label": label, "frames": frames, "seconds": round(seconds, 2),
              "s_per_frame": round(seconds / frames, 4), "peak_gpu_gb": round(peak, 2) if peak is not None else None,
-             "note": f"DetailNet compute + compose + crop to 8 bit on {device}, strength {strength}; excl. dump reading, "
-                     "video writing and the Apple AI base (Apple's own run); batch job running concurrently on GPU",
+             "note": note,
              "center_crop": center_crop, "out_size": out_size,
              "frame_pixels": 16 * plan.crop[2] * plan.crop[3], "clip": clip["name"], "ignore_cuts": ignore_cuts,
              "strength": strength, "ckpt": str(ckpt) if ckpt else None}
@@ -189,7 +232,9 @@ def run_clip(net, clip_dir, name, strength=1.0, ignore_cuts=False, device="mps",
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Run DetailNet over bench clips (see the module docstring).")
     ap.add_argument("clip_dirs", nargs="+", type=Path)
-    ap.add_argument("--ckpt", required=True, type=Path)
+    ap.add_argument("--ckpt", type=Path, help="DetailNet checkpoint (required unless --base-only)")
+    ap.add_argument("--base-only", action="store_true",
+                    help="no network: write the dumped Apple AI base (strength 0), the reference `apple-base` of bench/gates.py")
     ap.add_argument("--name", required=True, help="model name: outputs are out/NAME.mkv and NAME.json")
     ap.add_argument("--strength", type=float, default=1.0)
     ap.add_argument("--ignore-cuts", action="store_true", help="carry state across shot starts; writes NAME-nocut")
@@ -197,9 +242,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if "/" in args.name or args.name.endswith("-nocut"):
         ap.error("--name must be a plain model name (no slash, no -nocut suffix)")
+    if args.base_only == (args.ckpt is not None):
+        ap.error("give --ckpt to run DetailNet, or --base-only for the Apple AI base without a network, not both or neither")
 
-    from detailnet.train import load_checkpoint
-    net, _ = load_checkpoint(args.ckpt)
+    if args.base_only:
+        net = None
+    else:
+        from detailnet.train import load_checkpoint
+        net, _ = load_checkpoint(args.ckpt)
     failed = 0
     for clip_dir in args.clip_dirs:
         try:

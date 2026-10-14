@@ -1,4 +1,7 @@
-"""bench/gates.py: the go/no-go check. Synthetic per-clip metrics under a temporary clips directory, never output/."""
+"""bench/gates.py: the go/no-go check. Synthetic per-clip metrics under a temporary clips directory, never output/.
+
+The gates compare against `apple-base` (Apple AI's pre-encode output, the strength-0 run of run_bench); only the cut-leak
+gate uses the `apple` bench output, and `apple` is also printed as information."""
 import json
 import sys
 from pathlib import Path
@@ -13,6 +16,7 @@ import summarize  # noqa: E402
 C_CLIPS = ["c-static-foliage", "c-slow-gorge", "c-fast-waterfall", "c-water-climbers", "c-cut-nest"]
 G3_CLIPS = ["g3-lizard-grass", "g3-waterfall", "g3-wallaby-fast", "g3-frog-rain", "g3-cut-gorge"]
 
+REF = "apple-base"
 APPLE = {"detail": 2.0, "jitter_all": 0.2, "jitter": {"static": 0.1, "slow": 0.2, "fast": 0.4},
          "jitter_phase": [0.2, 0.2, 0.2, 0.2]}
 
@@ -30,15 +34,16 @@ def scaled(ratio_detail=1.5, ratio_jitter=1.1, ratio_bucket=1.1, phase=(1.1, 1.1
             "jitter_phase": [0.2 * p for p in phase]}
 
 
-def build(root, model="dn", detail=None, lpips=(0.30, 0.30), leak=(5.0, 5.0), apple_over=None, **kw):
-    """Apple and `model` metrics for every in-scope clip. `leak` and `lpips` are (model, apple)."""
+def build(root, model="dn", lpips=(0.30, 0.30), leak=(5.0, 5.0), ref_over=None, **kw):
+    """Metrics of the reference (apple-base), the bench output (apple) and `model` for every in-scope clip. `lpips` is
+    (model, reference) and `leak` (model, apple); apple-base has no cut_leak and apple's numbers equal the reference's, so
+    only the cut-leak gate and the information block read them."""
     for clip in C_CLIPS:
-        put(root, clip, "apple", **{**APPLE, **(apple_over or {})})
-        extra = {"cut_leak": leak[0]} if clip == "c-cut-nest" else {}
-        put(root, clip, model, **{**scaled(**kw), **extra})
-        if clip == "c-cut-nest":
-            put(root, clip, "apple", **{**APPLE, **(apple_over or {}), "cut_leak": leak[1]})
+        put(root, clip, REF, **{**APPLE, **(ref_over or {})})
+        put(root, clip, "apple", **{**APPLE, **({"cut_leak": leak[1]} if clip == "c-cut-nest" else {})})
+        put(root, clip, model, **{**scaled(**kw), **({"cut_leak": leak[0]} if clip == "c-cut-nest" else {})})
     for clip in G3_CLIPS:
+        put(root, clip, REF, lpips=lpips[1])
         put(root, clip, "apple", lpips=lpips[1])
         put(root, clip, model, lpips=lpips[0])
 
@@ -113,10 +118,10 @@ def test_ratios_are_means_over_clips_not_pooled(tmp_path):
 def test_bucket_ratio_uses_only_clips_that_have_the_bucket(tmp_path):
     build(tmp_path)
     for clip in C_CLIPS[:4]:  # no static pairs in four clips on either side (null), the remaining one is at 1.1
-        put(tmp_path, clip, "apple", **{**APPLE, "jitter": {"static": None, "slow": 0.2, "fast": 0.4}})
+        put(tmp_path, clip, REF, **{**APPLE, "jitter": {"static": None, "slow": 0.2, "fast": 0.4}})
         put(tmp_path, clip, "dn", **{**scaled(), "jitter": {"static": None, "slow": 0.22, "fast": 0.44}})
     put(tmp_path, "c-cut-nest", "dn", **{**scaled(), "cut_leak": 5.0, "jitter": {"static": 0.0099, "slow": None, "fast": None}})
-    put(tmp_path, "c-cut-nest", "apple", **{**APPLE, "cut_leak": 5.0, "jitter": {"static": 0.01, "slow": None, "fast": None}})
+    put(tmp_path, "c-cut-nest", REF, **{**APPLE, "jitter": {"static": 0.01, "slow": None, "fast": None}})
     result = by_name(gates.check_gates("dn", tmp_path))
     assert result["jitter_static"].value == pytest.approx(0.99) and result["jitter_static"].passed
     assert result["jitter_slow"].value == pytest.approx(1.1) and result["jitter_slow"].passed
@@ -148,9 +153,9 @@ def test_pulse_threshold_is_relative_to_the_models_own_mean(tmp_path):
 def test_scope_excludes_e_clips_and_other_clips(tmp_path):
     build(tmp_path)
     # a 1080p clip with terrible numbers, a gt clip with a terrible LPIPS, and a g (x4) clip: all out of scope
-    put(tmp_path, "e-gorge-river", "apple", **APPLE)
+    put(tmp_path, "e-gorge-river", REF, **APPLE)
     put(tmp_path, "e-gorge-river", "dn", **{**scaled(ratio_detail=0.5, ratio_jitter=9, ratio_bucket=9)})
-    put(tmp_path, "g-waterfall", "apple", lpips=0.1)
+    put(tmp_path, "g-waterfall", REF, lpips=0.1)
     put(tmp_path, "g-waterfall", "dn", lpips=0.9)
     assert all(statuses(tmp_path).values())
 
@@ -158,12 +163,12 @@ def test_scope_excludes_e_clips_and_other_clips(tmp_path):
 def test_missing_metrics_is_a_fail_with_a_message_not_a_crash(tmp_path):
     build(tmp_path)
     (tmp_path / "c-slow-gorge" / "metrics" / "dn.json").unlink()
-    (tmp_path / "g3-waterfall" / "metrics" / "apple.json").unlink()
+    (tmp_path / "g3-waterfall" / "metrics" / "apple-base.json").unlink()
     results = by_name(gates.check_gates("dn", tmp_path))
     for name in ("detail", "jitter_all", "jitter_static", "jitter_slow", "jitter_fast", "pulse"):
         assert not results[name].passed and "c-slow-gorge" in results[name].note and "dn.json" in results[name].note
     assert results["cut_leak"].passed  # c-cut-nest is intact
-    assert not results["lpips"].passed and "g3-waterfall" in results["lpips"].note and "apple.json" in results["lpips"].note
+    assert not results["lpips"].passed and "g3-waterfall" in results["lpips"].note and "apple-base.json" in results["lpips"].note
     assert gates.main(["dn", "--clips", str(tmp_path)]) == 1
 
 
@@ -188,14 +193,91 @@ def test_old_metrics_without_the_pulse_fields_fail_the_pulse_gate(tmp_path):
     assert not got.passed and "jitter_phase" in got.note and "c-slow-gorge" in got.note
 
 
-def test_apple_against_itself(tmp_path):
+def test_reference_against_itself_passes_every_ratio_gate_except_detail(tmp_path):
     for clip in C_CLIPS:
+        put(tmp_path, clip, REF, **APPLE)  # apple-base has no cut_leak: its run carries no state
         put(tmp_path, clip, "apple", **APPLE, **({"cut_leak": 4.0} if clip == "c-cut-nest" else {}))
+    put(tmp_path, "c-cut-nest", REF, **APPLE, cut_leak=0.0)  # run_bench --base-only --ignore-cuts: identical frames
     for clip in G3_CLIPS:
-        put(tmp_path, clip, "apple", lpips=0.3)
-    result = statuses(tmp_path, "apple")
+        put(tmp_path, clip, REF, lpips=0.3)
+        put(tmp_path, clip, "apple", lpips=0.33)
+    result = statuses(tmp_path, REF)
     assert not result.pop("detail")  # ratio 1.0 < 1.5, expected
-    assert all(result.values())
+    assert all(result.values()), result
+    got = by_name(gates.check_gates(REF, tmp_path))
+    assert got["lpips"].value == pytest.approx(0.3) and got["lpips"].threshold == pytest.approx(0.3)
+
+
+def test_the_default_reference_is_apple_base(tmp_path):
+    build(tmp_path, lpips=(0.31, 0.30))
+    put(tmp_path, "g3-waterfall", "apple", lpips=0.9)  # the bench output is not the reference
+    got = by_name(gates.check_gates("dn", tmp_path))["lpips"]
+    assert got.threshold == pytest.approx(0.30) and not got.passed
+    assert gates.REFERENCE == "apple-base"
+
+
+def test_every_gate_but_cut_leak_uses_the_reference_not_the_bench_output(tmp_path):
+    build(tmp_path)
+    for clip in C_CLIPS:  # the bench output is worse than the pre-encode base in every number the ratio gates read
+        put(tmp_path, clip, "apple", detail=1.0, jitter_all=0.01, jitter={"static": 0.001, "slow": 0.001, "fast": 0.001},
+            jitter_phase=[0.2] * 4, **({"cut_leak": 5.0} if clip == "c-cut-nest" else {}))
+    assert all(statuses(tmp_path).values())
+
+
+def test_cut_leak_is_compared_with_the_bench_apple_not_the_reference(tmp_path):
+    build(tmp_path, leak=(5.0, 5.0))
+    put(tmp_path, "c-cut-nest", REF, **APPLE, cut_leak=100.0)  # would pass if this were the threshold
+    got = by_name(gates.check_gates("dn", tmp_path))["cut_leak"]
+    assert got.threshold == pytest.approx(5.0) and got.passed
+    build(tmp_path, leak=(5.0, 4.0))
+    put(tmp_path, "c-cut-nest", REF, **APPLE, cut_leak=100.0)
+    assert not by_name(gates.check_gates("dn", tmp_path))["cut_leak"].passed
+    (tmp_path / "c-cut-nest" / "metrics" / "apple.json").unlink()
+    got = by_name(gates.check_gates("dn", tmp_path))["cut_leak"]
+    assert not got.passed and "apple.json" in got.note
+
+
+def test_missing_reference_metrics_fail_with_the_command_to_make_them(tmp_path):
+    build(tmp_path)
+    for clip in C_CLIPS + G3_CLIPS:
+        (tmp_path / clip / "metrics" / "apple-base.json").unlink()
+    results = by_name(gates.check_gates("dn", tmp_path))
+    for name in GATES:
+        if name in ("cut_leak", "pulse"):
+            assert results[name].passed  # these read the model (and apple for the leak) only, not the reference
+        else:
+            note = results[name].note
+            assert not results[name].passed and "apple-base.json" in note and "--base-only" in note, (name, note)
+    assert gates.main(["dn", "--clips", str(tmp_path)]) == 1
+
+
+def test_reference_can_be_chosen_on_the_command_line(tmp_path):
+    build(tmp_path)
+    for clip in C_CLIPS:  # a bench output that is much better than apple-base
+        put(tmp_path, clip, "apple", detail=1.0, jitter_all=0.01, jitter={"static": 0.001, "slow": 0.001, "fast": 0.001},
+            jitter_phase=[0.2] * 4, **({"cut_leak": 5.0} if clip == "c-cut-nest" else {}))
+    assert gates.main(["dn", "--clips", str(tmp_path)]) == 0
+    assert gates.main(["dn", "--clips", str(tmp_path), "--reference", "apple"]) == 1
+
+
+def test_apple_bench_numbers_are_printed_as_information_only(tmp_path, capsys):
+    build(tmp_path)
+    for clip in C_CLIPS:  # against the bench output the model would fail every ratio gate
+        put(tmp_path, clip, "apple", **{**APPLE, "detail": 4.0}, **({"cut_leak": 5.0} if clip == "c-cut-nest" else {}))
+    assert gates.main(["dn", "--clips", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    head, _, info = out.partition("Information only")
+    assert "OVERALL: PASS" in head and "apple-base" in head
+    assert info and "apple" in info and "0.7500" in info  # detail ratio 3.0 / 4.0 against the bench output
+    assert "PASS" not in info.split("\n", 1)[1] and "FAIL" not in info.split("\n", 1)[1]
+
+
+def test_information_block_does_not_affect_the_verdict_when_apple_is_missing(tmp_path, capsys):
+    build(tmp_path)
+    (tmp_path / "c-slow-gorge" / "metrics" / "apple.json").unlink()  # the info block cannot use this clip
+    assert gates.main(["dn", "--clips", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "OVERALL: PASS" in out and "n/a" in out.partition("Information only")[2]
 
 
 def test_summary_argument_is_accepted_and_not_read(tmp_path):

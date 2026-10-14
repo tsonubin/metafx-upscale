@@ -1,13 +1,19 @@
 """Go / no-go gates for a detail-layer model, computed from the per-clip metrics JSON of the in-scope clips.
 
-    python bench/gates.py MODEL [--summary output/sr-bench/summary.json] [--clips output/sr-bench/clips]
+    python bench/gates.py MODEL [--reference apple-base] [--summary output/sr-bench/summary.json] [--clips output/sr-bench/clips]
 
-Compares MODEL's `metrics/MODEL.json` with Apple AI's (`metrics/apple.json`) on the same clips and prints one PASS / FAIL line
-per gate with the numbers. Exit status 0 only when every gate passes. These gates decide whether the project continues, so
-they use only the clips M1 is judged on and never summary.json, which pools in the e-* (1080p) clips that wait for M3.
-`--summary` is accepted for the documented command line and ignored.
+Compares MODEL's `metrics/MODEL.json` with the reference's on the same clips and prints one PASS / FAIL line per gate with
+the numbers. Exit status 0 only when every gate passes. These gates decide whether the project continues, so they use only
+the clips M1 is judged on and never summary.json, which pools in the e-* (1080p) clips that wait for M3. `--summary` is
+accepted for the documented command line and ignored.
 
-Real-clip gates, over the c-* clips (the 720p -> 4K clips), as ratios MODEL / apple per clip, then averaged:
+The reference is `apple-base`: Apple AI's output before the bench's HEVC encode, which is exactly what DetailNet adds to. It
+is made by `python -m detailnet.run_bench --base-only --name apple-base CLIP_DIR...` (the strength-0 composite of the dumps) and
+scored like any model. The bench's own `apple` output has been through HEVC and an ffmpeg colour conversion (about 2 levels
+darker, slightly lower LPIPS), so gating against it would hand DetailNet a handicap before it adds anything. The cut-leak gate
+is the one exception, see below. After the gated table the same numbers against `apple` are printed as information only.
+
+Real-clip gates, over the c-* clips (the 720p -> 4K clips), as ratios MODEL / reference per clip, then averaged:
 
     detail          mean ratio of `detail` (gradient energy vs the bicubic) >= 1.5
     jitter_all      mean ratio of `jitter_all` <= 1.1
@@ -17,9 +23,11 @@ Real-clip gates, over the c-* clips (the 720p -> 4K clips), as ratios MODEL / ap
 
 Other gates:
 
-    cut_leak        MODEL's `cut_leak` on c-cut-nest <= apple's. MODEL's own is the difference between its cut-aware run and its
-                    cut-ignoring run (out/MODEL-nocut) over the same base (run_bench --ignore-cuts)
-    lpips           mean `lpips` over the g3-* clips (360p -> 1080p, vs the real 1080p) <= apple's mean
+    cut_leak        MODEL's `cut_leak` on c-cut-nest <= the bench `apple` output's. MODEL's own is the difference between its
+                    cut-aware run and its cut-ignoring run (out/MODEL-nocut) over the same base (run_bench --ignore-cuts). It is
+                    compared with `apple`, not the reference: apple-base carries no state across a cut, so its leak is 0 by
+                    construction (a base-only --ignore-cuts run writes identical frames, which scores 0)
+    lpips           mean `lpips` over the g3-* clips (360p -> 1080p, vs the real 1080p) <= the reference's mean
 
 Anything the gates need that is missing (a metrics file, a key, a clip) is a FAIL with a message saying what, never a crash and
 never a silent pass. Ratios are compared with a 1e-9 tolerance so a value exactly at its threshold passes.
@@ -33,7 +41,10 @@ from typing import NamedTuple, Optional
 import numpy as np
 
 CLIPS = Path(__file__).resolve().parent.parent / "output" / "sr-bench" / "clips"
-REFERENCE = "apple"
+REFERENCE = "apple-base"  # Apple AI before the bench's HEVC encode: what DetailNet adds to
+BENCH_APPLE = "apple"  # Apple AI as the bench encodes it: the cut-leak threshold, and the information block
+HINTS = {REFERENCE: "generate it with `python -m detailnet.run_bench --base-only --name apple-base "
+                    "output/sr-bench/clips/c-* output/sr-bench/clips/g3-*` and score it with bench/score_all.sh"}
 REAL_PREFIX = "c-"  # the real clips M1 is judged on (e-* are 1080p: M3)
 GT3_PREFIX = "g3-"  # the x3 ground-truth clips
 CUT_CLIP = "c-cut-nest"
@@ -66,7 +77,8 @@ def scope(root, prefix):
 def load(root, clip, model):
     path = Path(root) / clip / "metrics" / f"{model}.json"
     if not path.exists():
-        raise Missing(f"missing metrics file {path}")
+        hint = f" ({HINTS[model]})" if model in HINTS else ""
+        raise Missing(f"missing metrics file {path}{hint}")
     try:
         return json.loads(path.read_text())
     except ValueError as error:
@@ -146,8 +158,9 @@ def failed(name, op, threshold, message):
     return Gate(name, None, op, threshold, False, message)
 
 
-def check_gates(model, clips_root=CLIPS, reference=REFERENCE):
-    """The list of Gates for `model`, in the order they are printed."""
+def check_gates(model, clips_root=CLIPS, reference=REFERENCE, leak_reference=BENCH_APPLE):
+    """The list of Gates for `model`, in the order they are printed. Every gate but cut_leak compares with `reference`;
+    cut_leak compares with `leak_reference`."""
     root = Path(clips_root)
     results = []
 
@@ -176,8 +189,8 @@ def check_gates(model, clips_root=CLIPS, reference=REFERENCE):
                              f"max / mean of the {model} jitter_phase averaged over {n} {REAL_PREFIX}* clips: [{shown}]"))
 
     try:
-        mine, theirs = load(root, CUT_CLIP, model), load(root, CUT_CLIP, reference)
-        for who, m in ((model, mine), (reference, theirs)):
+        mine, theirs = load(root, CUT_CLIP, model), load(root, CUT_CLIP, leak_reference)
+        for who, m in ((model, mine), (leak_reference, theirs)):
             if field(m, "cut_leak") is None:
                 hint = (" (run run_bench --ignore-cuts for it and re-score)" if who == model else "")
                 raise Missing(f"{CUT_CLIP}/metrics/{who}.json has no 'cut_leak'{hint}")
@@ -185,7 +198,7 @@ def check_gates(model, clips_root=CLIPS, reference=REFERENCE):
         results.append(failed("cut_leak", "<=", None, str(error)))
     else:
         results.append(judge("cut_leak", float(mine["cut_leak"]), "<=", float(theirs["cut_leak"]),
-                             f"{model} on {CUT_CLIP} vs {reference} (threshold = {reference}'s)"))
+                             f"{model} on {CUT_CLIP} vs {leak_reference} (threshold = {leak_reference}'s)"))
 
     try:
         values = {}
@@ -217,15 +230,31 @@ def format_table(results):
     return "\n".join(lines)
 
 
+def format_info(results, reference):
+    """The same numbers against another reference, with no verdict. A number that cannot be computed shows n/a and why."""
+    lines = [f"Information only (not gated): the same numbers against the bench output `{reference}` (after the HEVC encode)",
+             f"{'gate':14s} {'value':>9s}   {'limit':>11s}  note"]
+    for g in results:
+        value = "n/a" if g.value is None else f"{g.value:.4f}"
+        limit = "" if g.threshold is None else f"{g.op} {g.threshold:.4f}"
+        lines.append(f"{g.name:14s} {value:>9s}   {limit:>11s}  {g.note}")
+    return "\n".join(lines)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Go / no-go gates for a detail-layer model (see the module docstring).")
     ap.add_argument("model")
+    ap.add_argument("--reference", default=REFERENCE,
+                    help=f"what the gates compare with (default {REFERENCE}: Apple AI before the HEVC encode)")
     ap.add_argument("--summary", help="accepted for compatibility and ignored: the gates read the per-clip metrics")
     ap.add_argument("--clips", type=Path, default=CLIPS, help="the clips directory (default: output/sr-bench/clips)")
     args = ap.parse_args(argv)
-    results = check_gates(args.model, args.clips)
-    print(f"model {args.model} vs {REFERENCE}; clips under {args.clips}")
+    results = check_gates(args.model, args.clips, args.reference)
+    print(f"model {args.model} vs {args.reference} (cut leak vs {BENCH_APPLE}); clips under {args.clips}")
     print(format_table(results))
+    if args.reference != BENCH_APPLE:
+        print()
+        print(format_info(check_gates(args.model, args.clips, BENCH_APPLE), BENCH_APPLE))
     return 0 if all(g.passed for g in results) else 1
 
 
