@@ -26,6 +26,7 @@ Everything here was built and measured on a MacBook Pro with an M5 Max (64 GB), 
 - [Limits and known issues](#limits-and-known-issues)
 - [Project layout](#project-layout)
 - [Building and testing](#building-and-testing)
+- [License](#license)
 
 ## Findings
 
@@ -316,3 +317,10 @@ source bench/env.sh && python -m pytest detailnet/tests   # DetailNet and bench 
 ```
 
 Requires macOS 14+ on Apple silicon. The `ml` engine and the app need macOS 26+. ffmpeg (`brew install ffmpeg`) is needed for WebM/MKV input and for the benchmark.
+
+## License
+
+Apache-2.0 (see `LICENSE` and `NOTICE`).
+- **DetailNet r2 weights:** published at https://huggingface.co/tsonubin/DetailNet under the same license.
+- **Credits:** DetailNet was trained against FlashVSR v1.1 (Apache-2.0) outputs.
+- **Footage:** the documentary footage used for training and benchmarking is copyrighted and isn't included.

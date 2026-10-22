@@ -1,0 +1,15 @@
+metafx-upscale
+Copyright 2026 Shay Zhang
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+DetailNet was trained against texture targets produced by FlashVSR v1.1
+(https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1), licensed under the
+Apache License, Version 2.0. bench/flashvsr_mps.py is a port of FlashVSR's
+inference to Apple's MPS backend.
+
+The upscaler uses Apple's VideoToolbox (VTSuperResolutionScaler) and MetalFX
+frameworks at runtime on the user's Mac; nothing from Apple is redistributed.
+
+The training and benchmark footage (ABC nature documentaries) is copyrighted
+and is not included in this repository.
